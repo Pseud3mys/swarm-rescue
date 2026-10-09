@@ -30,9 +30,10 @@ from swarm_rescue.maps.map_test_special_zones import MapTestSpecialZones
 
 from swarm_rescue.solutions.my_drone_eval import MyDroneEval
 from swarm_rescue.solutions.my_drone_navigation import MyDroneNavigation
+from swarm_rescue.solutions.drone import SwarmDrone
 
 
-class MyDrone(MyDroneNavigation):
+class MyDrone(SwarmDrone):
     """Custom drone class for evaluation."""
     pass
 
