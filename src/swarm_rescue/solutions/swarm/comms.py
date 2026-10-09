@@ -20,7 +20,8 @@ from .world import WorldModel
 
 @dataclass
 class GossipConfig:
-    max_patches: int = 6        # tuiles de carte par pas (~256 octets chacune)
+    max_patches: int = 40       # tuiles de carte par pas (~256 octets chacune). Le simulateur n'impose aucune limite ;
+                                # à 6, le plafond était atteint à chaque pas et les cartes prenaient 20-140 tuiles de retard.
     peer_ttl: int = 5           # un voisin non entendu depuis N pas n'est plus pris en compte
     resend_cooldown: int = 3    # évite de réémettre la même tuile avant l'arrivée de l'accusé
 
@@ -44,12 +45,15 @@ class Gossip:
         self._peers: dict = {}   # sender -> (t_entendu, Digest)
         self._sent: dict = {}    # (origin, cx, cy) -> (rev, t)
         self.stats: Counter = Counter()
+        self.heard: set = set()  # émetteurs entendus au dernier ingest (= liens radio réels à ce pas)
 
     def ingest(self, packets: Iterable[Packet], t: int) -> None:
         w = self.world
+        self.heard = set()
         for p in packets:
             if p.sender == w.me:
                 continue
+            self.heard.add(p.sender)
             self._peers[p.sender] = (t, p.digest)
             self.stats["agents"] += sum(w.merge_agent(a) for a in p.agents)
             self.stats["objects"] += sum(w.merge_object(o) for o in p.objects)

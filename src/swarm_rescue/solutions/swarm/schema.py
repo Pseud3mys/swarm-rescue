@@ -31,6 +31,7 @@ class MissionKind(IntEnum):
     CARRY = 3
     RETURN = 4
     RELAY = 5  # rester en position centrale pour servir de messager
+    FOLLOW = 6  # suivre un meneur d'exploration à distance radio (binôme)
 
 
 class ObjKind(IntEnum):
@@ -62,6 +63,7 @@ class Mission:
     kind: MissionKind = MissionKind.IDLE
     target: Optional[Vec] = None
     started: int = 0
+    peer: int = -1      # FOLLOW : identifiant du meneur suivi
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class AgentState:
     health: float
     mission: Mission
     route: tuple[Waypoint, ...] = ()
+    heard: tuple[int, ...] = ()     # voisins dont j'ai reçu un paquet à ce pas (liens radio réels)
 
 
 @dataclass(frozen=True)

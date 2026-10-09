@@ -53,10 +53,11 @@ class WorldModel:
 
     # ---- écritures locales (je suis propriétaire) -----------------------
     def publish_self(self, t: int, pos: Vec, vel: Vec, health: float,
-                     mission: Mission, route: tuple[Waypoint, ...] = ()) -> AgentState:
+                     mission: Mission, route: tuple[Waypoint, ...] = (), heard=()) -> AgentState:
         self._agent_seq += 1
         a = AgentState(self.me, self._agent_seq, t, (float(pos[0]), float(pos[1])),
-                       (float(vel[0]), float(vel[1])), float(health), mission, tuple(route))
+                       (float(vel[0]), float(vel[1])), float(health), mission, tuple(route),
+                       tuple(sorted(int(h) for h in heard)))
         self.agents[self.me] = a
         return a
 

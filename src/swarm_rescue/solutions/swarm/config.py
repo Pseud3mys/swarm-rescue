@@ -48,7 +48,10 @@ class Params:
     max_pose_sigma_for_mapping: float = 14.0
 
     # ---- planification --------------------------------------------------------------------------
-    inflate_cells: int = 2             # gonflage des obstacles (cellules)
+    inflate_cells: int = 2             # gonflage des obstacles (cellules) : contrainte dure (16 px + rayon du drone)
+    wall_cost_cells: float = 6.0       # coût de proximité des murs jusqu'à 6 cellules (48 px) : reste au milieu des couloirs
+    wall_cost: float = 6.0             # surcoût max (collé au mur)
+    los_wall_cells: float = 3.0        # les raccourcis en ligne droite ne passent pas à moins de 3 cellules d'un mur
     inflate_cells_tight: int = 1       # repli si le but est injoignable
     unknown_cost: float = 2.5          # coût d'un pas en terrain inconnu (planification optimiste)
     frontier_min_cells: int = 3
@@ -64,9 +67,28 @@ class Params:
     repulse_dist: float = 28.0
     vel_time_const: float = 6.0        # pas : constante de temps de l'asservissement de vitesse
 
+    # ---- équipe / réseau (teamplan.py) ----------------------------------------------------------
+    # unités de coût : longueur de chemin en cellules (8 px) pondérée par le coût du terrain
+    link_range: float = 220.0          # px : écart max entre deux maillons du réseau (radio 250 px, marge)
+    team_fresh: int = 100              # pas : un drone non entendu depuis plus longtemps est hors de mon réseau
+    team_min_for_base: int = 4         # à partir de N drones libres, l'un reste posté à la base
+    team_max_frontiers: int = 4        # binômes d'exploration reliés au réseau, au plus
+    team_max_excursions: int = 3       # binômes (ou solos) hors réseau avec les drones restants, au plus
+    frontier_spacing: float = 150.0    # px : deux binômes ne visent pas des frontières plus proches que ça
+    frontier_size_gain: float = 2.0    # une grande frontière passe devant une petite un peu plus proche
+    standby_ring: float = 50.0         # px : réserve répartie en anneau autour de la base
+    wounded_bonus: float = 80.0        # un blessé passe devant une frontière (en coût de chemin)
+    sticky_radius: float = 60.0        # px : même tâche si la cible a bougé de moins que ça
+    sticky_gain: float = 0.7           # hystérésis : coût de la tâche déjà annoncée x 0.7 ...
+    sticky_bonus: float = 5.0          # ... moins ce bonus
+    follow_dist: float = 70.0          # px : le suiveur se tient à cette distance derrière le meneur
+    pair_max: float = 160.0            # px : au-delà, le meneur attend son suiveur
+    follow_replan: int = 12            # pas : rafraîchissement de la route du suiveur
+
     # ---- missions ----------------------------------------------------------------------------------
     grasp_dist: float = 32.0
     rescue_approach_dist: float = 120.0  # centre de secours vu plus près : on fonce dessus à vue (le blessé est sauvé au contact)
     rescue_approach_speed: float = 1.2
     rescue_spin_dist: float = 30.0     # centre plus près que ça : on tourne sur place pour que le blessé le touche
+    recover_steps: int = 30            # durée de la manœuvre de dégagement après un blocage
     drop_check_steps: int = 20         # après une dépose, un blessé encore visible n'est PAS sauvé

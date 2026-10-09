@@ -14,6 +14,8 @@ Utilise la vérité terrain uniquement pour l'affichage. Aucun effet sur le comp
 """
 from __future__ import annotations
 
+import os
+import sys
 from collections import Counter
 from typing import List, Optional
 
@@ -22,6 +24,8 @@ import numpy as np
 from .swarm.gridmap import CLIP, FREE_THR, OCC_THR
 from .swarm.schema import MissionKind, ObjKind, ObjState
 
+_ROLE = {MissionKind.EXPLORE: "M", MissionKind.FOLLOW: "S", MissionKind.RELAY: "R", MissionKind.GOTO_WOUNDED: "B",
+         MissionKind.CARRY: "P", MissionKind.RETURN: "H", MissionKind.IDLE: "I"}
 _STATE_COLOR = {ObjState.SEEN: (230, 40, 40), ObjState.CARRIED: (255, 150, 0), ObjState.RESCUED: (40, 180, 60)}
 _SMALL_COLS = 5
 
@@ -87,14 +91,16 @@ class _BigPanel:
         self.img.setRect(rect)
         plot.addItem(self.img)
         self.routes = [plot.plot([], [], pen=pg.mkPen(c, width=2)) for c in colors]
+        self.links = plot.plot([], [], pen=pg.mkPen((0, 170, 0, 160), width=1), connect="pairs")
         self.errors = plot.plot([], [], pen=pg.mkPen((220, 0, 0), width=2), connect="pairs")
+        self.slots = pg.ScatterPlotItem(size=13, pen=pg.mkPen((120, 0, 160), width=2), brush=None)
         self.true_wounded = pg.ScatterPlotItem(size=20, symbol="o", pen=pg.mkPen((0, 0, 0), width=2), brush=None)
         self.objects = pg.ScatterPlotItem(size=10, pen=None)
         self.targets = pg.ScatterPlotItem(size=16, symbol="x", pen=None)
         self.truth = pg.ScatterPlotItem(size=8, pen=None, brush=pg.mkBrush(90, 90, 90, 220))
         self.est = pg.ScatterPlotItem(size=16, brush=None)
         self.labels = []
-        for it in (self.true_wounded, self.objects, self.truth, self.targets, self.est):
+        for it in (self.true_wounded, self.slots, self.objects, self.truth, self.targets, self.est):
             plot.addItem(it)
         for c in colors:
             lab = pg.TextItem("", color=c, anchor=(0, 1))
@@ -116,6 +122,10 @@ class SwarmDebugView:
 
     # ------------------------------------------------------------------ construction
     def _build(self, drones) -> None:
+        if sys.platform == "win32":
+            # Sans ça, Qt rend le processus "DPI-aware" et la fenêtre du simulateur (pyglet), jusque-là agrandie
+            # par la mise à l'échelle de Windows, rétrécit d'un coup. À fixer avant le premier import de Qt.
+            os.environ.setdefault("QT_QPA_PLATFORM", "windows:dpiawareness=0")
         import pyqtgraph as pg
         from PySide6.QtCore import QRectF
         from PySide6.QtWidgets import QApplication
@@ -190,7 +200,7 @@ class SwarmDebugView:
             est.append(p)
             est_pens.append(pg.mkPen(col, width=3))
             err_seg += [p, d.true_position()]
-            big.labels[i].setText(str(d.identifier))
+            big.labels[i].setText(f"{d.identifier}{_ROLE.get(b.mission.kind, '?')}")
             big.labels[i].setPos(float(p[0]) + 6, float(p[1]) + 6)
             missions[b.mission.kind.name] += 1
             if b.mission.target is not None:
@@ -206,10 +216,27 @@ class SwarmDebugView:
         big.objects.setData(_object_spots(objects))
         big.true_wounded.setData(pos=self._true_wounded(drones))
 
+        # liens radio réels (vérité simulateur) et postes prévus par le plan d'équipe du premier drone vivant
+        seg_links = []
+        for d in alive:
+            for c in d.communicator.comms_in_range:
+                o = c.agent
+                if id(d) < id(o) and not o.removed and not d.communicator_is_disabled()                         and not o.communicator_is_disabled():
+                    seg_links += [d.true_position(), o.true_position()]
+        seg_links = np.array(seg_links).reshape(-1, 2)
+        big.links.setData(seg_links[:, 0], seg_links[:, 1]) if len(seg_links) else big.links.setData([], [])
+        plan = alive[0]._brain.team.last if alive else None
+        spots = []
+        if plan is not None:
+            for s in plan.slots:
+                if s.kind in ("relay", "base"):
+                    spots.append({"pos": s.xy, "symbol": "d" if s.kind == "relay" else "star"})
+        big.slots.setData(spots)
+
         errs = [float(np.linalg.norm(d._brain.ekf.pose().pos - d.true_position())) for d in alive]
         carriers = sum(1 for d in alive if d.grasped_wounded_persons())
         dup = sum(n - 1 for n in wounded_targets.values() if n > 1)
-        mis = "  ".join(f"{k[:4]}:{v}" for k, v in sorted(missions.items()))
+        mis = "  ".join(f"{_ROLE.get(MissionKind[k], k)}:{v}" for k, v in sorted(missions.items()))
         big.plot.setTitle(f"pas {t} | vivants {len(alive)}/{len(drones)} | porteurs {carriers} | "
                           f"doublons de cible {dup} | err pose moy {np.mean(errs) if errs else 0:.1f}px "
                           f"max {max(errs, default=0):.1f}px | {mis}", size="10pt")

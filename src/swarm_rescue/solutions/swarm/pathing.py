@@ -67,7 +67,9 @@ class PlanGrid:
         self.unknown = unknown
         self.trav = ~blocked
         d = cv2.distanceTransform((1 - closed).astype(np.uint8), cv2.DIST_L2, 3)
-        prox = np.clip((4.0 - d) / 4.0, 0.0, 1.0) ** 2 * 2.0
+        rw = params.wall_cost_cells
+        prox = np.clip((rw - d) / rw, 0.0, 1.0) ** 2 * params.wall_cost
+        self.los_max_cost = 1.0 + params.wall_cost * ((rw - params.los_wall_cells) / rw) ** 2
         cost = 1.0 + prox
         cost = np.where(unknown, cost * params.unknown_cost, cost)
         if extra_cost is not None:
@@ -75,6 +77,7 @@ class PlanGrid:
         self.cost = cost.astype(np.float32)
         self._dist: Optional[np.ndarray] = None
         self._pred: Optional[np.ndarray] = None
+        self._g = None
 
     # ------------------------------------------------------------------ graphe + Dijkstra
     def solve(self) -> None:
@@ -94,10 +97,36 @@ class PlanGrid:
             rows.append(idx[sl_s][ok]); cols.append(idx[sl_d][ok]); wts.append(w[ok])
         r, c, w = np.concatenate(rows), np.concatenate(cols), np.concatenate(wts)
         g = coo_matrix((w, (r, c)), shape=(W * H, W * H)).tocsr()
+        self._g = g
         src = self.start[0] * H + self.start[1]
         dist, pred = dijkstra(g, directed=False, indices=src, return_predecessors=True)
         self._dist = dist.reshape(W, H)
         self._pred = pred
+
+    # ------------------------------------------------------------------ Dijkstra depuis d'autres points
+    def dists_from(self, cells) -> np.ndarray:
+        """Distances (n, W, H) depuis plusieurs cellules sources, sur le même graphe (après solve())."""
+        H = self.H
+        idx = [c[0] * H + c[1] for c in cells]
+        if not idx:
+            return np.zeros((0, self.W, H))
+        d = dijkstra(self._g, directed=False, indices=idx)
+        return np.asarray(d).reshape(len(idx), self.W, H)
+
+    def tree_from(self, cell):
+        """(distances (W, H), prédécesseurs) depuis une cellule : pour tracer des chemins depuis un point fixe."""
+        src = cell[0] * self.H + cell[1]
+        d, pred = dijkstra(self._g, directed=False, indices=src, return_predecessors=True)
+        return d.reshape(self.W, self.H), pred
+
+    @staticmethod
+    def lookup(dist: np.ndarray, cell, radius: int = 3) -> float:
+        """Distance au point `cell` en tolérant une cellule bloquée (agent collé à un mur gonflé)."""
+        W, H = dist.shape
+        x0, x1 = max(cell[0] - radius, 0), min(cell[0] + radius + 1, W)
+        y0, y1 = max(cell[1] - radius, 0), min(cell[1] + radius + 1, H)
+        v = dist[x0:x1, y0:y1]
+        return float(v.min()) if v.size else float("inf")
 
     # ------------------------------------------------------------------ requêtes
     def cell(self, xy) -> tuple[int, int]:
@@ -120,10 +149,12 @@ class PlanGrid:
         c = self.nearest_reachable(xy, radius)
         return float("inf") if c is None else float(self._dist[c])
 
-    def _trace(self, cell) -> Optional[list]:
-        pred, H = self._pred, self.H
+    def _trace(self, cell, pred=None, src_cell=None) -> Optional[list]:
+        H = self.H
+        pred = self._pred if pred is None else pred
+        src_cell = self.start if src_cell is None else src_cell
         n = cell[0] * H + cell[1]
-        src = self.start[0] * H + self.start[1]
+        src = src_cell[0] * H + src_cell[1]
         out = [n]
         for _ in range(self.W * self.H):
             if n == src:
@@ -143,7 +174,11 @@ class PlanGrid:
         t = np.linspace(0.0, 1.0, n + 1)
         xs = np.rint(a[0] + (b[0] - a[0]) * t).astype(int)
         ys = np.rint(a[1] + (b[1] - a[1]) * t).astype(int)
-        return bool(self.trav[xs, ys].all() and not (self.cost[xs, ys] > 2.2 * 1.0 + 2.0).any())
+        return bool(self.trav[xs, ys].all() and not (self.cost[xs, ys] > self.los_max_cost).any())
+
+    def path_cells(self, cell, pred, src_cell) -> Optional[list]:
+        """Chemin (liste de cellules, non simplifié) de `src_cell` à `cell` d'après un arbre de tree_from()."""
+        return self._trace(cell, pred, src_cell)
 
     def route_to(self, xy, t: int, speed: float, radius: int = 6) -> Optional[Route]:
         goal = self.nearest_reachable(xy, radius)
@@ -152,6 +187,8 @@ class PlanGrid:
         cells = self._trace(goal)
         if not cells:
             return None
+        if len(cells) == 1:
+            cells = [cells[0], cells[0]]
         cells = self._simplify(cells)
         pts = self.m.cell_to_world(np.array([c[0] for c in cells]), np.array([c[1] for c in cells]))
         # le dernier point est le but réel s'il est proche de la cellule atteinte
