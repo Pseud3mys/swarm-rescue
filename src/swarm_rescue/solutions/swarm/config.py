@@ -10,10 +10,13 @@ from dataclasses import dataclass
 @dataclass
 class Params:
     # ---- dynamique du drone (unités : px, pas de simulation) ------------------------------
-    dt: float = 1 / 30                 # constants.FRAME_RATE
-    accel_per_cmd: float = 6.0 / 900   # (LINEAR_FORCE*LINEAR_SPEED_RATIO / masse) * dt^2 = 6 px/s^2 -> px/pas^2
-    drag: float = 0.95 ** (1 / 30)     # SPACE_DAMPING^dt : perte de vitesse par pas
-    ang_per_cmd: float = 0.3 * 0.6 / 30  # rad/pas pour rotation = 1 (très lent : on ne tourne presque jamais)
+    # Un pas de simulation = 10 micro-pas pymunk de 0,1 s (playground.step), soit 1 s de physique ;
+    # la force n'est appliquée que pendant le 1er micro-pas (pymunk la remet à zéro). Valeurs mesurées
+    # en boucle ouverte sur le vrai simulateur (forward = 1, rotation = 1).
+    dt: float = 1.0                    # s de physique par pas
+    accel_per_cmd: float = 0.55        # px/pas^2 pour forward = 1 (300 N / 50 kg * 0.1 s ~ 0.6, moins le frottement)
+    drag: float = 0.95                 # SPACE_DAMPING par seconde de physique = par pas
+    ang_per_cmd: float = 0.176         # rad/pas pour rotation = 1 (ANGULAR_VELOCITY * ANGULAR_SPEED_RATIO * 1 s)
     robot_radius: float = 10.0
 
     # ---- capteurs (drone_sensors.py) ---------------------------------------------------------
@@ -35,7 +38,7 @@ class Params:
     landmark_sigma_r: float = 2.5
     landmark_sigma_b: float = math.radians(1.5)
     gate_chi2: float = 11.0
-    accel_model_trust: float = 0.003   # écart-type d'accélération non modélisée (px/pas^2)
+    accel_model_trust: float = 0.15    # écart-type d'accélération non modélisée (px/pas^2)
 
     # ---- carte ------------------------------------------------------------------------------------
     resolution: float = 8.0
@@ -53,15 +56,17 @@ class Params:
     switch_gain: float = 0.75          # une nouvelle cible doit coûter < 75 % de l'actuelle pour la remplacer
 
     # ---- contrôle ---------------------------------------------------------------------------------
-    v_cruise: float = 1.6              # px/pas (≈ 48 px/s)
-    v_carry: float = 1.0
+    v_cruise: float = 4.0              # px/pas (vitesse max théorique ~11 px/pas)
+    v_carry: float = 2.5
     brake_frac: float = 0.7            # part de l'accélération max réservée au freinage
     lookahead: float = 45.0
     wall_margin: float = 14.0
     repulse_dist: float = 28.0
-    vel_time_const: float = 40.0       # pas : constante de temps de l'asservissement de vitesse
+    vel_time_const: float = 6.0        # pas : constante de temps de l'asservissement de vitesse
 
     # ---- missions ----------------------------------------------------------------------------------
     grasp_dist: float = 32.0
-    release_dist: float = 10.0         # distance au bord du centre de secours pour lâcher (contact ; à vérifier sur le simulateur)
+    rescue_approach_dist: float = 120.0  # centre de secours vu plus près : on fonce dessus à vue (le blessé est sauvé au contact)
+    rescue_approach_speed: float = 1.2
+    rescue_spin_dist: float = 30.0     # centre plus près que ça : on tourne sur place pour que le blessé le touche
     drop_check_steps: int = 20         # après une dépose, un blessé encore visible n'est PAS sauvé

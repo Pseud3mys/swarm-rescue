@@ -71,9 +71,9 @@ class PoseEKF:
     def predict(self, odom, gps_avail: bool, compass_avail: bool, last_cmd=(0.0, 0.0), last_rot: float = 0.0) -> None:
         """odom = (dist, alpha, dtheta) ou None. `last_cmd` = (forward, lateral) et `last_rot` = ordres du pas précédent.
 
-        Cap : le drone ne tourne presque jamais (rotation lente, et on la commande peu). Le bruit de l'odomètre sur theta
-        (1°/pas, marche aléatoire) est bien plus grand que la rotation réelle : on prédit donc theta avec le modèle
-        (ordre de rotation x gain) et on n'écoute l'odomètre que s'il signale une vraie rotation (choc, etc.)."""
+        Cap : on intègre toujours la rotation mesurée par l'odomètre (bruit blanc 1°/pas, corrigé par la boussole).
+        Le modèle "ordre de rotation x gain" ne voit pas les rotations subies (chocs, couple du blessé porté) :
+        l'ignorer faisait dériver le cap de plusieurs dizaines de degrés pendant un portage."""
         p = self.p
         x, P = self.x, self.P
         F = np.eye(6)
@@ -86,15 +86,13 @@ class PoseEKF:
             x[1] += d * s
             F[0, 2] = -d * s
             F[1, 2] = d * c
-            spinning = abs(dth) > 2.5 * p.odom_sigma_theta
-            model_dth = p.ang_per_cmd * last_rot
-            x[2] += dth if spinning else model_dth
+            x[2] += dth
             # bruit (dist, alpha, theta) -> (px, py, th)
             G = np.array([[c, -d * s, 0.0], [s, d * c, 0.0], [0.0, 0.0, 1.0]])
             S = np.diag([p.odom_sigma_dist ** 2, p.odom_sigma_alpha ** 2, p.odom_sigma_theta ** 2])
             Q[:3, :3] = G @ S @ G.T
             Q[2, :] = 0.0; Q[:, 2] = 0.0
-            Q[2, 2] = p.odom_sigma_theta ** 2 if spinning else math.radians(0.08) ** 2
+            Q[2, 2] = p.odom_sigma_theta ** 2
             vm = np.array([d * c, d * s])
         else:                                       # odomètre coupé : on inflate l'incertitude
             Q[:2, :2] = np.eye(2) * 0.5

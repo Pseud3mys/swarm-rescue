@@ -203,6 +203,8 @@ class Brain:
         v_est = pose.vel
         override_dir, override_speed = None, 0.0
         hold = False
+        repulse = True
+        spin = False
 
         if self._pending_drop is not None:
             key, deadline, t_drop = self._pending_drop
@@ -235,18 +237,29 @@ class Brain:
                 self._grasp = 0                                    # saisie ratée : on réessaie
 
         if f.carrying:
+            # Le blessé est sauvé quand IL TOUCHE le centre de secours : on garde la pince fermée et on fonce
+            # dessus à vue. Le lidar voit le centre comme un mur : sans ça, marge et répulsion nous arrêtent avant.
             self._grasp = 1
-            arrived = (self.mission.kind == MissionKind.CARRY and self.mission.target is not None
-                       and np.linalg.norm(np.array(self.mission.target) - pose.pos) < 14.0)
-            if arrived or any(d < p.release_dist for _, d in seen["rescue"]):
-                self._grasp = 0                                    # dépose (verdict dans _pending_drop)
-                hold = True
+            near = [(pos, d) for pos, d in seen["rescue"] if d < p.rescue_approach_dist]
+            if near:
+                pos, d = min(near, key=lambda x: x[1])
+                to = pos - pose.pos
+                override_dir = to / max(float(np.linalg.norm(to)), 1e-6)
+                override_speed = p.rescue_approach_speed
+                repulse = False
+                # Collé au centre : le blessé (PivotJoint) traîne derrière nous et ne le touche pas.
+                # En tournant sur nous-mêmes, le point de pivot fait orbiter le blessé, qui balaie le centre.
+                spin = d < p.rescue_spin_dist
 
         end_stop = self.mission.kind in (MissionKind.EXPLORE, MissionKind.CARRY, MissionKind.GOTO_WOUNDED,
                                          MissionKind.RETURN, MissionKind.IDLE)
         cmd = self.follower.command(pose, v_est, f.lidar, f.angles, self.theta_ref, self._speed(f.carrying),
                                     grasp=self._grasp, hold=hold or self.route is None,
-                                    override_dir=override_dir, override_speed=override_speed, end_stop=end_stop)
+                                    override_dir=override_dir, override_speed=override_speed, end_stop=end_stop,
+                                    repulse=repulse)
+        if spin:
+            cmd = Command(cmd.forward, cmd.lateral, 1.0, cmd.grasper)
+            self.theta_ref = pose.theta            # on garde le cap atteint une fois la dépose faite
 
         # blocage : on commande de l'accélération mais on ne bouge pas
         moving_cmd = self.follower.last_cmd_mag > 0.6 and self.route is not None and override_dir is None

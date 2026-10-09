@@ -78,7 +78,7 @@ class PathFollower:
     def command(self, pose: Pose, v_est: np.ndarray, ranges: Optional[np.ndarray], angles: Optional[np.ndarray],
                 theta_ref: float, v_cruise: float, grasp: int = 0, hold: bool = False,
                 override_dir: Optional[np.ndarray] = None, override_speed: float = 0.0,
-                end_stop: bool = True) -> Command:
+                end_stop: bool = True, repulse: bool = True) -> Command:
         p = self.p
         a_b = p.brake_frac * p.accel_per_cmd
         pos = pose.pos
@@ -117,11 +117,12 @@ class PathFollower:
                 vt = min(vt, self._clearance_cap(pose, ranges, angles, u, a_b))
             v_des = (u * vt) if u is not None else np.zeros(2)
 
-        # répulsion douce des obstacles proches
-        if ranges is not None and angles is not None:
+        # répulsion douce des obstacles proches (coupée quand on veut justement toucher la cible)
+        if repulse and ranges is not None and angles is not None:
             v_des = v_des + self._repulsion(pose, ranges, angles)
 
-        a_des = (v_des - v_est) / p.vel_time_const
+        # rejoindre v_des en vel_time_const pas + compenser le frottement (v_next = drag * v + a)
+        a_des = (v_des - v_est) / p.vel_time_const + (1.0 - p.drag) * v_est
         cmd_w = a_des / p.accel_per_cmd
         n = float(np.linalg.norm(cmd_w))
         if n > 1.0:

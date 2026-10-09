@@ -3,6 +3,6 @@ video_capture_enabled: false  # Enable video recording of the mission (true/fals
 
 evaluation_plan:
   - map_name: MapMedium02
-    nb_rounds: 2
+    nb_rounds: 1
     config_weight: 1
     zones_config: []

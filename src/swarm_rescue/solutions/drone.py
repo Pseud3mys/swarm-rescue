@@ -7,6 +7,8 @@ Les points à vérifier sur le vrai simulateur sont marqués ADAPT.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from swarm_rescue.simulation.drone.controller import CommandsDict
@@ -29,12 +31,20 @@ def _kind(entity_type) -> str:
     return "other"
 
 
+_DEBUG_VIEW = None   # fenêtre unique partagée par tous les drones (cf. debug_view.py)
+
+
 class SwarmDrone(DroneAbstract):
+    # Debug (à couper pour la soumission, ou via la variable d'environnement SWARM_DEBUG=0) :
+    DEBUG_VIEW = os.environ.get("SWARM_DEBUG", "1") != "0"   # fenêtre Qt avec la carte interne de chaque drone
+    DEBUG_PERIOD = 10                                        # rafraîchissement de cette fenêtre (pas)
+
     def __init__(self, identifier=None, misc_data=None, **kwargs):
         super().__init__(identifier=identifier, misc_data=misc_data, **kwargs)
         self._brain = None
         self._t = 0
         self._origin = int(self.identifier) if identifier is not None and 0 <= int(identifier) < MAX_ORIGINS else None
+        self._debug_group = None
 
     def _ensure_brain(self):
         if self._brain is None:
@@ -67,3 +77,20 @@ class SwarmDrone(DroneAbstract):
         )
         self._t += 1
         return self._brain.step(frame).as_dict()
+
+    # ------------------------------------------------------------------ debug (affichage seulement)
+    def display(self) -> None:
+        """Appelée à chaque pas par le GUI, sur le premier drone seulement : pilote la fenêtre de debug."""
+        super().display()
+        if not self.DEBUG_VIEW:
+            return
+        if self._debug_group is None:
+            pg = self.playground
+            if pg is None or getattr(pg.window, "headless", False):
+                return
+            self._debug_group = [a for a in pg.agents if isinstance(a, SwarmDrone)]
+        global _DEBUG_VIEW
+        if _DEBUG_VIEW is None:
+            from .debug_view import SwarmDebugView
+            _DEBUG_VIEW = SwarmDebugView(self.DEBUG_PERIOD)
+        _DEBUG_VIEW.update(self._debug_group, self._t)

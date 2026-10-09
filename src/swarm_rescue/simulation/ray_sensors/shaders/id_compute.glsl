@@ -43,12 +43,12 @@
 
             layout(std430, binding = 2) buffer sparams
             {
-                SensorParam sensor_params[N_SENSORS];
+                SensorParam sensor_params[];
             } Params;
 
             layout(std430, binding = 3) buffer coordinates
             {
-                Coordinate coords[N_SENSORS];
+                Coordinate coords[];
             } In;
 
             layout(std430, binding = 4) buffer hit_points
@@ -58,7 +58,8 @@
 
             layout(std430, binding=5) buffer invisible_ids
             {
-                int inv_ids[N_SENSORS][MAX_N_INVISIBLE];
+                // flat [N_SENSORS * MAX_N_INVISIBLE] : sized 2D arrays crash the Intel UHD driver at compile time
+                int inv_ids[];
             }InvIDs;
 
             layout(std430, binding=6) buffer view_params
@@ -103,7 +104,7 @@
                 float angle = in_coord.angle;
 
                 // INVISIBLE POINTS
-                int inv_pts[MAX_N_INVISIBLE] = InvIDs.inv_ids[i_sensor];
+                int inv_base = i_sensor*MAX_N_INVISIBLE;
 
                 // CENTER AND END OF RAY
                 vec2 center = vec2(sensor_x_on_view, sensor_y_on_view);
@@ -131,7 +132,7 @@
 
                         for(int ind_inv=0; ind_inv<MAX_N_INVISIBLE; ind_inv++)
                         {
-                            if (inv_pts[ind_inv] == id_out)
+                            if (InvIDs.inv_ids[inv_base + ind_inv] == id_out)
                             {
                                 invisible = true;
                                 id_out = 0;
