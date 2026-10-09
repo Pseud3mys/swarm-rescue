@@ -15,6 +15,7 @@ class Params:
     # en boucle ouverte sur le vrai simulateur (forward = 1, rotation = 1).
     dt: float = 1.0                    # s de physique par pas
     accel_per_cmd: float = 0.55        # px/pas^2 pour forward = 1 (300 N / 50 kg * 0.1 s ~ 0.6, moins le frottement)
+    accel_per_cmd_carry: float = 0.18  # en portant : blessé de 100 kg accroché au drone de 50 kg -> masse x3
     drag: float = 0.95                 # SPACE_DAMPING par seconde de physique = par pas
     ang_per_cmd: float = 0.176         # rad/pas pour rotation = 1 (ANGULAR_VELOCITY * ANGULAR_SPEED_RATIO * 1 s)
     robot_radius: float = 10.0
@@ -73,10 +74,10 @@ class Params:
     team_fresh: int = 100              # pas : un drone non entendu depuis plus longtemps est hors de mon réseau
     team_min_for_base: int = 4         # à partir de N drones libres, l'un reste posté à la base
     team_max_frontiers: int = 4        # binômes d'exploration reliés au réseau, au plus
-    team_max_excursions: int = 3       # binômes (ou solos) hors réseau avec les drones restants, au plus
+    team_max_excursions: int = 2       # binômes (ou solos) hors réseau, au plus : le réseau se scinde en 3 morceaux max
     frontier_spacing: float = 150.0    # px : deux binômes ne visent pas des frontières plus proches que ça
     frontier_size_gain: float = 2.0    # une grande frontière passe devant une petite un peu plus proche
-    standby_ring: float = 50.0         # px : réserve répartie en anneau autour de la base
+    standby_ring: float = 110.0        # px : base et réserve en anneau autour du centre, pas sur son point d'accès
     wounded_bonus: float = 80.0        # un blessé passe devant une frontière (en coût de chemin)
     sticky_radius: float = 60.0        # px : même tâche si la cible a bougé de moins que ça
     sticky_gain: float = 0.7           # hystérésis : coût de la tâche déjà annoncée x 0.7 ...
@@ -90,5 +91,18 @@ class Params:
     rescue_approach_dist: float = 120.0  # centre de secours vu plus près : on fonce dessus à vue (le blessé est sauvé au contact)
     rescue_approach_speed: float = 1.2
     rescue_spin_dist: float = 30.0     # centre plus près que ça : on tourne sur place pour que le blessé le touche
+    # ---- saisie, priorités de passage, passage de relais du blessé ------------------------------
+    grasp_close_dist: float = 60.0     # px : pince fermée dès cette distance (la saisie se fait au contact)
+    approach_min_speed: float = 1.0    # px/pas : vitesse mini de l'approche finale (heurter un blessé ne coûte rien)
+    approach_mask_deg: float = 30.0    # rayons lidar ignorés autour de la cible (sinon la répulsion nous en écarte)
+    inflate_cells_carry: int = 3       # porteur : le blessé dépasse, on garde plus de marge (repli 2 puis 1)
+    yield_radius: float = 75.0         # px : en dessous, le drone le moins prioritaire s'écarte
+    yield_path_dist: float = 40.0      # px : ... si la route annoncée de l'autre passe à moins de ça de lui
+    yield_speed: float = 1.5
+    handoff_enabled: bool = False      # désactivé : le donneur reste collé au receveur et ils se bloquent (à reprendre)
+    queue_max_wait: int = 40           # pas : attente max derrière un drone qui va dans le même sens, puis on passe
+    handoff_gain: float = 150.0        # px : un receveur doit être au moins ça plus près du centre que le porteur
+    handoff_range: float = 220.0       # px : et à portée radio du porteur
+    handoff_timeout: int = 200         # pas : passage de relais abandonné au-delà
     recover_steps: int = 30            # durée de la manœuvre de dégagement après un blocage
     drop_check_steps: int = 20         # après une dépose, un blessé encore visible n'est PAS sauvé

@@ -64,7 +64,7 @@ class TeamPlanner:
         p, w = self.p, self.w
         out = [(w.me, pose.pos, current)]
         for a in w.others():
-            if t - a.t > p.team_fresh or a.health <= 0 or a.mission.kind == MissionKind.CARRY:
+            if t - a.t > p.team_fresh or a.health <= 0 or a.mission.kind in (MissionKind.CARRY, MissionKind.RECEIVE):
                 continue
             out.append((a.origin, np.array(a.pos), a.mission))
         out.sort(key=lambda x: x[0])
@@ -103,8 +103,9 @@ class TeamPlanner:
             if cell is not None:
                 slots.append(Slot("wounded", pos, cell))
         remaining = n - len(slots)
+        n_base = 0
         if remaining >= p.team_min_for_base:
-            slots.append(Slot("base", root_xy, root_cell))
+            n_base = 1                                  # posé sur l'anneau avec la réserve (plus bas)
             remaining -= 1
 
         # ---- frontières : dans l'ordre de distance à la base, tant qu'on peut les relier
@@ -148,13 +149,26 @@ class TeamPlanner:
                 remaining -= 1
         for r in relays:
             slots.append(Slot("relay", r, grid.cell(r)))
-        # drones en trop : réserve autour de la base (anneau, pour ne pas s'empiler)
-        for k in range(max(remaining, 0)):
-            a = 2 * math.pi * k / max(remaining, 1)
-            xy = root_xy + p.standby_ring * np.array((math.cos(a), math.sin(a)))
-            cell = grid.nearest_reachable(xy, radius=6)
-            if cell is not None:
-                slots.append(Slot("base", m.cell_to_world(np.array([cell[0]]), np.array([cell[1]]))[0], cell))
+        # base + drones en trop : en anneau autour du centre de secours, pas sur son point d'accès (sinon ils
+        # bloquent les porteurs) ni empilés. Positions candidates sur l'anneau, on garde les plus accessibles.
+        n_ring = n_base + max(remaining, 0)
+        if n_ring:
+            ring = []
+            for k in range(12):
+                a = 2 * math.pi * k / 12
+                xy = root_xy + p.standby_ring * np.array((math.cos(a), math.sin(a)))
+                cell = grid.nearest_reachable(xy, radius=4)
+                if cell is not None and math.isfinite(dist_root[cell]):
+                    ring.append((float(dist_root[cell]), cell))
+            ring.sort()
+            picked = []
+            for _, cell in ring:
+                xy = m.cell_to_world(np.array([cell[0]]), np.array([cell[1]]))[0]
+                if all(np.linalg.norm(xy - q) > 45.0 for q in picked):
+                    picked.append(xy)
+                    slots.append(Slot("base", xy, cell))
+                if len(picked) >= n_ring:
+                    break
 
         plan = TeamPlan(t, root_xy, slots)
         if not slots:

@@ -25,7 +25,7 @@ from .swarm.gridmap import CLIP, FREE_THR, OCC_THR
 from .swarm.schema import MissionKind, ObjKind, ObjState
 
 _ROLE = {MissionKind.EXPLORE: "M", MissionKind.FOLLOW: "S", MissionKind.RELAY: "R", MissionKind.GOTO_WOUNDED: "B",
-         MissionKind.CARRY: "P", MissionKind.RETURN: "H", MissionKind.IDLE: "I"}
+         MissionKind.CARRY: "P", MissionKind.RETURN: "H", MissionKind.IDLE: "I", MissionKind.RECEIVE: "T"}
 _STATE_COLOR = {ObjState.SEEN: (230, 40, 40), ObjState.CARRIED: (255, 150, 0), ObjState.RESCUED: (40, 180, 60)}
 _SMALL_COLS = 5
 

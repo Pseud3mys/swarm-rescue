@@ -32,6 +32,7 @@ class MissionKind(IntEnum):
     RETURN = 4
     RELAY = 5  # rester en position centrale pour servir de messager
     FOLLOW = 6  # suivre un meneur d'exploration à distance radio (binôme)
+    RECEIVE = 7  # aller prendre le blessé d'un porteur (passage de relais), peer = porteur
 
 
 class ObjKind(IntEnum):
@@ -63,7 +64,7 @@ class Mission:
     kind: MissionKind = MissionKind.IDLE
     target: Optional[Vec] = None
     started: int = 0
-    peer: int = -1      # FOLLOW : identifiant du meneur suivi
+    peer: int = -1      # FOLLOW : meneur suivi ; CARRY : receveur demandé (passage de relais) ; RECEIVE : porteur
 
 
 @dataclass(frozen=True)

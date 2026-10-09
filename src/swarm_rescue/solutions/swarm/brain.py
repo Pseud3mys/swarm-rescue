@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
+from dataclasses import replace
 from typing import Optional
 
 import numpy as np
@@ -64,6 +65,13 @@ class Brain:
         self._recover_until = -1
         self._recover_dir = None
         self._n_recover = 0
+        self._carry_since = 0
+        self._handoff = None            # porteur : {"peer", "since", "ack"} passage de relais en cours
+        self._handoff_ban: dict = {}    # receveur -> pas jusqu'auquel on ne le sollicite plus
+        self._handoff_release = False   # le lâcher en cours est un passage de relais (pas une dépose)
+        self._recv_since = 0
+        self._wait_since = None         # début de l'attente en file (même sens, drone devant)
+        self._no_wait_until = -1
         self._last_follow = -10 ** 9
         self.timing = {"est": 0.0, "map": 0.0, "plan": 0.0, "ctl": 0.0, "n_plan": 0}
 
@@ -79,7 +87,8 @@ class Brain:
 
         # ---- estimation
         self.ekf.predict(f.odom, f.gps is not None, f.compass is not None,
-                         (self.last_cmd.forward, self.last_cmd.lateral), self.last_cmd.rotation)
+                         (self.last_cmd.forward, self.last_cmd.lateral), self.last_cmd.rotation,
+                         accel=p.accel_per_cmd_carry if f.carrying else p.accel_per_cmd)
         self.ekf.update_gps(f.gps, f.compass)
         self.ekf.update_compass(f.compass)
         if not self.ekf.initialized:
@@ -108,17 +117,22 @@ class Brain:
                 if tr is None:
                     tr = w.observe_object(ObjKind.WOUNDED, pose.pos, t, ObjState.SEEN)
                 self._carry_key = tr.key
+                self._carry_since = t
                 w.set_state(tr.key, ObjState.CARRIED, t)
+            elif self._handoff_release:                            # passé à un autre drone : sa piste prend le relais
+                self._handoff_release = False
+                self._carry_key = None
             elif self._carry_key is not None:                      # dépose : verdict après quelques pas (cf. _control)
                 self._pending_drop = (self._carry_key, t + self.p.drop_check_steps, t)
                 self._carry_key = None
             self._grasp = 1 if f.carrying else 0
             self._was_carrying = f.carrying
+        self._handoff_logic(t, pose, f)
         reason = self._replan_reason(t, pose, f, seen)
         if reason:
             self.last_reason = reason
             self._replan(t, pose, f)
-        elif self.mission.kind == MissionKind.FOLLOW and t - self._last_follow >= p.follow_replan:
+        elif self.mission.kind in (MissionKind.FOLLOW, MissionKind.RECEIVE) and t - self._last_follow >= p.follow_replan:
             self._refresh_follow(t, pose, f)
         t3 = T()
 
@@ -187,10 +201,15 @@ class Brain:
         tic = time.perf_counter()
         self._last_plan = t
         p, w = self.p, self.world
+        if self.mission.kind == MissionKind.RECEIVE and not f.carrying:
+            self._refresh_follow(t, pose, f)                   # passage de relais en cours : on ne réaffecte pas
+            return
         extra = extra_cost_from_agents(w, t, w.map, (w.map.W, w.map.H), self.me)
         route, chosen = None, None
         team_mission = None
-        for k in (None, p.inflate_cells_tight):
+        # porteur : le blessé dépasse du drone, on planifie avec plus de marge aux murs (repli si injoignable)
+        inflates = (p.inflate_cells_carry, None, p.inflate_cells_tight) if f.carrying else (None, p.inflate_cells_tight)
+        for k in inflates:
             grid = PlanGrid(w, p, pose.pos, inflate=k, extra_cost=extra)
             grid.solve()
             cands = []
@@ -216,6 +235,8 @@ class Brain:
             if chosen is not None:
                 break
         self.mission = chosen or Mission(MissionKind.IDLE)
+        if f.carrying and self._handoff is not None and self.mission.kind == MissionKind.CARRY:
+            self.mission = replace(self.mission, peer=self._handoff["peer"])   # demande de relais toujours annoncée
         self.route = route
         self.follower.set_route(route)
         self._arrived_t = None
@@ -224,13 +245,139 @@ class Brain:
         self.timing["n_plan"] += 1
 
     def _route_for(self, grid, cand, t, pose, carrying) -> Optional[Route]:
-        if cand.kind != MissionKind.FOLLOW:
+        if cand.kind not in (MissionKind.FOLLOW, MissionKind.RECEIVE):
             return grid.route_to(cand.target, t, self._speed(carrying))
-        leader = self.world.agents.get(cand.peer)
-        if leader is None or t - leader.t > 30:
-            return None                                       # meneur perdu : on passe au candidat suivant
-        r = grid.route_to(leader.pos, t, self._speed(carrying))
-        return None if r is None else _truncate(r, self.p.follow_dist, pose.pos)
+        peer = self.world.agents.get(cand.peer)
+        if peer is None or t - peer.t > 30:
+            return None                                       # meneur / porteur perdu : candidat suivant
+        r = grid.route_to(peer.pos, t, self._speed(carrying))
+        back = self.p.follow_dist if cand.kind == MissionKind.FOLLOW else 25.0
+        return None if r is None else _truncate(r, back, pose.pos)
+
+    # ------------------------------------------------------------------ passage de relais du blessé
+    def _handoff_logic(self, t, pose, f) -> None:
+        """Porteur : demande à un relais plus proche du centre de prendre le blessé, puis le lâche quand ce
+        relais l'a saisi. Receveur : répond à la demande. Tout passe par les missions annoncées (gossip)."""
+        p, w = self.p, self.world
+        if not p.handoff_enabled:
+            return
+        if f.carrying:
+            h = self._handoff
+            if h is None:
+                if t % 10 or t - self._carry_since < 20 or self.mission.kind != MissionKind.CARRY:
+                    return
+                R = self.planner.rescue_point()
+                if R is None:
+                    return
+                d_me = float(np.linalg.norm(R - pose.pos))
+                best, bd = None, p.handoff_range
+                for a in w.others():
+                    if t - a.t > 5 or a.health <= 5 or self._handoff_ban.get(a.origin, -1) > t \
+                            or a.mission.kind not in (MissionKind.RELAY, MissionKind.IDLE):
+                        continue
+                    d = float(np.linalg.norm(np.array(a.pos) - pose.pos))
+                    if d < bd and float(np.linalg.norm(R - np.array(a.pos))) < d_me - p.handoff_gain:
+                        best, bd = a.origin, d
+                if best is not None:
+                    self._handoff = {"peer": best, "since": t, "ack": False}
+                    self.mission = replace(self.mission, peer=best)
+                return
+            a = w.agents.get(h["peer"])
+            fresh = a is not None and t - a.t <= 10
+            if fresh and a.mission.kind == MissionKind.RECEIVE and a.mission.peer == self.me:
+                h["ack"] = True
+            if fresh and h["ack"] and a.mission.kind == MissionKind.CARRY \
+                    and np.linalg.norm(np.array(a.pos) - pose.pos) < 80.0:
+                self._grasp = 0                                # il tient le blessé : on lâche
+                self._handoff_release = True
+                self._handoff = None
+                return
+            if not fresh or t - h["since"] > p.handoff_timeout or (not h["ack"] and t - h["since"] > 60):
+                self._handoff_ban[h["peer"]] = t + 400
+                self._handoff = None
+                if self.mission.kind == MissionKind.CARRY:
+                    self.mission = replace(self.mission, peer=-1)
+            return
+        self._handoff = None
+        if self.mission.kind != MissionKind.RECEIVE:
+            if self.mission.kind not in (MissionKind.RELAY, MissionKind.IDLE):
+                return
+            req = [a for a in w.others() if t - a.t <= 5 and a.mission.kind == MissionKind.CARRY
+                   and a.mission.peer == self.me]
+            if req:
+                a = min(req, key=lambda x: x.origin)
+                self.mission = Mission(MissionKind.RECEIVE, a.pos, t, a.origin)
+                self._recv_since = t
+                self._last_follow = -10 ** 9                   # route vers le porteur au prochain pas
+            return
+        g = w.agents.get(self.mission.peer)
+        if g is None or t - g.t > 10 or g.mission.kind != MissionKind.CARRY or g.mission.peer != self.me \
+                or t - self._recv_since > p.handoff_timeout:
+            self.mission = Mission(MissionKind.IDLE)          # demande retirée / échouée : retour à l'équipe
+            self._plan_reason = "stuck"
+
+    # ------------------------------------------------------------------ priorités de passage
+    @staticmethod
+    def _prio(kind) -> int:
+        return {MissionKind.CARRY: 5, MissionKind.RECEIVE: 4, MissionKind.GOTO_WOUNDED: 3,
+                MissionKind.EXPLORE: 2, MissionKind.FOLLOW: 2, MissionKind.RETURN: 1,
+                MissionKind.RELAY: 1}.get(kind, 0)
+
+    def _my_dir(self, pose) -> Optional[np.ndarray]:
+        if self.route is None or len(self.route.pts) < 2:
+            return None
+        proj, seg, _ = self.follower._project(pose.pos)
+        c = self.follower._carrot(proj, seg, self.p.lookahead) - pose.pos
+        n = float(np.linalg.norm(c))
+        return c / n if n > 1e-6 else None
+
+    def _yield_dir(self, t, pose, f) -> Optional[np.ndarray]:
+        """Direction d'évitement si un drone plus prioritaire arrive sur moi (sa route annoncée passe près de moi).
+        Priorité : porteur > receveur > va-chercher > explorateur/suiveur > relais/réserve, puis plus petit identifiant."""
+        p = self.p
+        mine = 5 if f.carrying else self._prio(self.mission.kind)
+        me = pose.pos
+        best, bd = None, p.yield_radius
+        for a in self.world.others():
+            if t - a.t > 3:
+                continue
+            ap = np.array(a.pos)
+            d = float(np.linalg.norm(ap - me))
+            if d >= bd:
+                continue
+            pa = self._prio(a.mission.kind)
+            if pa < mine or (pa == mine and a.origin > self.me):
+                continue
+            if self.mission.kind in (MissionKind.FOLLOW, MissionKind.RECEIVE) and a.origin == self.mission.peer:
+                continue                                       # on ne fuit pas celui qu'on rejoint
+            if a.mission.kind == MissionKind.RECEIVE and a.mission.peer == self.me:
+                continue                                       # ni celui qui vient prendre notre blessé
+            pts = [ap] + [np.array((w.x, w.y)) for w in a.route if w.eta >= t]
+            if len(pts) < 2:
+                continue                                       # il ne va nulle part
+            q, dq = _closest_on_polyline(np.array(pts), me)
+            if dq >= p.yield_path_dist:
+                continue
+            their = pts[1] - pts[0]
+            their = their / max(float(np.linalg.norm(their)), 1e-6)
+            mine_dir = self._my_dir(pose)
+            if mine_dir is not None and float(mine_dir @ their) > 0.3:
+                # même sens : pas d'esquive. S'il est devant moi, j'attends derrière (file d'attente).
+                if float((ap - me) @ mine_dir) > 0 and d < 60.0:
+                    best, bd = ("wait", None), d
+                continue
+            best, bd = (q, ap), d
+        if best is None:
+            return None
+        q, ap = best
+        if isinstance(q, str):
+            return np.zeros(2)                                 # attendre : vitesse nulle
+        perp, away = me - q, me - ap
+        v = away / max(np.linalg.norm(away), 1e-6) * 0.6
+        if np.linalg.norm(perp) > 3.0:
+            v = v + perp / np.linalg.norm(perp)
+        n = float(np.linalg.norm(v))
+        return v / n if n > 1e-6 else None
 
     def _refresh_follow(self, t, pose, f) -> None:
         """Suiveur : la route vers le meneur est recalculée souvent, sans refaire l'allocation d'équipe."""
@@ -253,6 +400,7 @@ class Brain:
         hold = False
         repulse = True
         spin = False
+        lidar = f.lidar
 
         if self._pending_drop is not None:
             key, deadline, t_drop = self._pending_drop
@@ -269,12 +417,9 @@ class Brain:
             if vis:
                 self._sighting_t = t
                 pos, d = min(vis, key=lambda x: x[1])
-                if d < 90.0:                                       # approche finale à vue
-                    dirv = (pos - pose.pos) / max(np.linalg.norm(pos - pose.pos), 1e-6)
-                    a_b = 0.5 * p.brake_frac * p.accel_per_cmd     # freinage prudent : la boucle de vitesse a du retard
-                    override_dir = dirv
-                    override_speed = min(p.v_cruise, max(0.3, math.sqrt(2 * a_b * max(d - 0.6 * p.grasp_dist, 0.0))))
-                    if d < p.grasp_dist:
+                if d < 90.0:                                       # approche finale à vue, jusqu'au contact
+                    override_dir, override_speed, lidar = self._approach(pose, pos, d, f)
+                    if d < p.grasp_close_dist:
                         self._grasp, self._grasp_since = 1, t
             elif np.linalg.norm(tgt - pose.pos) < 35.0:
                 if self._arrived_t is None:
@@ -285,6 +430,35 @@ class Brain:
                     self._plan_reason = "stuck"
             if self._grasp and not f.carrying and t - self._grasp_since > 40:
                 self._grasp = 0                                    # saisie ratée : on réessaie
+
+        if self.mission.kind == MissionKind.RECEIVE and not f.carrying:
+            g = self.world.agents.get(self.mission.peer)
+            if g is not None:                                  # blessé porté par le donneur, vu près de lui
+                gp = np.array(g.pos)
+                vis = [(pos, d) for pos, d, st in seen["wounded"] if st == ObjState.CARRIED
+                       and np.linalg.norm(pos - gp) < 60.0]
+                if vis:
+                    pos, d = min(vis, key=lambda x: x[1])
+                    if d < 90.0:
+                        override_dir, override_speed, lidar = self._approach(pose, pos, d, f)
+                        if d < p.grasp_close_dist:
+                            self._grasp, self._grasp_since = 1, t
+                elif np.linalg.norm(gp - pose.pos) < 80.0:
+                    # blessé caché derrière le porteur (la vue sémantique s'arrête au premier drone) : on tourne
+                    # autour du porteur à ~50 px jusqu'à le voir
+                    rel = pose.pos - gp
+                    a = math.atan2(rel[1], rel[0]) + math.radians(50.0)
+                    goal = gp + 50.0 * np.array((math.cos(a), math.sin(a)))
+                    to = goal - pose.pos
+                    override_dir = to / max(float(np.linalg.norm(to)), 1e-6)
+                    override_speed = 1.0
+            if self._grasp and t - self._grasp_since > 40:
+                self._grasp = 0
+
+        if f.carrying and self._handoff is not None:           # le receveur arrive : on l'attend sur place
+            g = self.world.agents.get(self._handoff["peer"])
+            if g is not None and np.linalg.norm(np.array(g.pos) - pose.pos) < 90.0:
+                hold = True
 
         if f.carrying:
             # Le blessé est sauvé quand IL TOUCHE le centre de secours : on garde la pince fermée et on fonce
@@ -313,6 +487,26 @@ class Brain:
             self._hist.append((t, pose.pos.copy()))
         expect_move = (not hold and not spin and self.route is not None
                        and (override_dir is not None or self.follower.remaining(pose.pos) > 25.0))
+        ydir = None if t < self._recover_until else self._yield_dir(t, pose, f)
+        if ydir is not None and not ydir.any():      # même sens, il est juste devant : on attend (pas trop longtemps)
+            if self._wait_since is None:
+                self._wait_since = t
+            if t - self._wait_since > p.queue_max_wait or t < self._no_wait_until:
+                if t - self._wait_since > p.queue_max_wait:
+                    self._no_wait_until, self._wait_since = t + 60, None   # il est bloqué devant : on n'attend plus
+                ydir = None
+        else:
+            self._wait_since = None
+        if ydir is not None and not ydir.any():
+            hold = True
+            override_dir, spin = None, False
+            expect_move = False
+            self._hist.clear()
+            ydir = None
+        if ydir is not None:                        # un drone plus prioritaire arrive : on lui laisse le passage
+            override_dir, override_speed, repulse, lidar = ydir, p.yield_speed, True, f.lidar
+            expect_move = False
+            self._hist.clear()
         if t < self._recover_until:
             override_dir, override_speed, repulse = self._recover_dir, 1.0, True
             spin = f.carrying                       # en tournant, le pivot fait orbiter le blessé : il se décroche
@@ -328,14 +522,30 @@ class Brain:
 
         end_stop = self.mission.kind in (MissionKind.EXPLORE, MissionKind.CARRY, MissionKind.GOTO_WOUNDED,
                                          MissionKind.RETURN, MissionKind.IDLE, MissionKind.RELAY, MissionKind.FOLLOW)
-        cmd = self.follower.command(pose, v_est, f.lidar, f.angles, self.theta_ref, self._speed(f.carrying),
+        cmd = self.follower.command(pose, v_est, lidar, f.angles, self.theta_ref, self._speed(f.carrying),
                                     grasp=self._grasp, hold=hold or self.route is None,
                                     override_dir=override_dir, override_speed=override_speed, end_stop=end_stop,
-                                    repulse=repulse)
+                                    repulse=repulse,
+                                    accel=p.accel_per_cmd_carry if f.carrying else p.accel_per_cmd)
         if spin:
             cmd = Command(cmd.forward, cmd.lateral, 1.0, cmd.grasper)
             self.theta_ref = pose.theta            # on garde le cap atteint une fois la manœuvre faite
         return cmd
+
+    def _approach(self, pose, pos, d, f):
+        """Approche finale d'un blessé : droit dessus, vitesse limitée par le freinage mais jamais nulle (le heurter
+        ne coûte rien), rayons lidar vers lui ignorés (sinon la répulsion et le freinage nous en tiennent à l'écart)."""
+        p = self.p
+        to = pos - pose.pos
+        dirv = to / max(float(np.linalg.norm(to)), 1e-6)
+        a_b = 0.5 * p.brake_frac * p.accel_per_cmd
+        speed = min(p.v_cruise, max(p.approach_min_speed, math.sqrt(2 * a_b * max(d - 15.0, 0.0))))
+        lidar = f.lidar
+        if lidar is not None:
+            rel = np.asarray(f.angles) + pose.theta - math.atan2(dirv[1], dirv[0])
+            rel = (rel + np.pi) % (2 * np.pi) - np.pi
+            lidar = np.where(np.abs(rel) < math.radians(p.approach_mask_deg), np.inf, lidar)
+        return dirv, speed, lidar
 
     def _start_recovery(self, t, pose, f) -> None:
         """Recul à l'opposé de l'obstacle le plus proche, dévié de ±40° (alterné à chaque tentative)."""
@@ -371,3 +581,17 @@ def _truncate(r: Route, back: float, here) -> Route:
     pts = np.vstack([P[:i], end[None, :]])
     eta = np.r_[E[:i], E[i]]
     return Route(pts, eta, (float(end[0]), float(end[1])), r.t0)
+
+
+def _closest_on_polyline(P: np.ndarray, x: np.ndarray):
+    """Point de la polyligne P (N, 2) le plus proche de x, et sa distance."""
+    best, bd = P[0], float(np.linalg.norm(P[0] - x))
+    for a, b in zip(P[:-1], P[1:]):
+        ab = b - a
+        L2 = float(ab @ ab)
+        s = 0.0 if L2 < 1e-9 else float(np.clip((x - a) @ ab / L2, 0.0, 1.0))
+        q = a + s * ab
+        d = float(np.linalg.norm(x - q))
+        if d < bd:
+            best, bd = q, d
+    return best, bd

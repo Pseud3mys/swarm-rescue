@@ -78,9 +78,11 @@ class PathFollower:
     def command(self, pose: Pose, v_est: np.ndarray, ranges: Optional[np.ndarray], angles: Optional[np.ndarray],
                 theta_ref: float, v_cruise: float, grasp: int = 0, hold: bool = False,
                 override_dir: Optional[np.ndarray] = None, override_speed: float = 0.0,
-                end_stop: bool = True, repulse: bool = True) -> Command:
+                end_stop: bool = True, repulse: bool = True, accel: Optional[float] = None) -> Command:
+        """`accel` : accélération obtenue pour une commande de 1 (plus faible en portant un blessé)."""
         p = self.p
-        a_b = p.brake_frac * p.accel_per_cmd
+        accel = p.accel_per_cmd if accel is None else accel
+        a_b = p.brake_frac * accel
         pos = pose.pos
         v_des = np.zeros(2)
         u = None
@@ -123,7 +125,7 @@ class PathFollower:
 
         # rejoindre v_des en vel_time_const pas + compenser le frottement (v_next = drag * v + a)
         a_des = (v_des - v_est) / p.vel_time_const + (1.0 - p.drag) * v_est
-        cmd_w = a_des / p.accel_per_cmd
+        cmd_w = a_des / accel
         n = float(np.linalg.norm(cmd_w))
         if n > 1.0:
             cmd_w /= n

@@ -68,7 +68,8 @@ class PoseEKF:
         self.initialized = self.pos_init
 
     # ------------------------------------------------------------------ prédiction
-    def predict(self, odom, gps_avail: bool, compass_avail: bool, last_cmd=(0.0, 0.0), last_rot: float = 0.0) -> None:
+    def predict(self, odom, gps_avail: bool, compass_avail: bool, last_cmd=(0.0, 0.0), last_rot: float = 0.0,
+                accel: Optional[float] = None) -> None:
         """odom = (dist, alpha, dtheta) ou None. `last_cmd` = (forward, lateral) et `last_rot` = ordres du pas précédent.
 
         Cap : on intègre toujours la rotation mesurée par l'odomètre (bruit blanc 1°/pas, corrigé par la boussole).
@@ -108,14 +109,14 @@ class PoseEKF:
             Q[5, 5] = p.compass_sigma ** 2 * (1 - p.compass_phi ** 2)
             x[5] *= p.compass_phi
         self.P = F @ P @ F.T + Q
-        self._predict_velocity(last_cmd, vm)
+        self._predict_velocity(last_cmd, vm, p.accel_per_cmd if accel is None else accel)
 
-    def _predict_velocity(self, cmd, vm) -> None:
+    def _predict_velocity(self, cmd, vm, accel: float) -> None:
         """Filtre scalaire (commun aux deux axes) : modèle d'accélération connu + mesure odométrique."""
         p = self.p
         th = self.x[2]
         fwd, lat = cmd
-        a = p.accel_per_cmd * np.array([fwd * math.cos(th) - lat * math.sin(th),
+        a = accel * np.array([fwd * math.cos(th) - lat * math.sin(th),
                                         fwd * math.sin(th) + lat * math.cos(th)])
         self.v = p.drag * self.v + a
         self.pv = self.pv * p.drag ** 2 + p.accel_model_trust ** 2
