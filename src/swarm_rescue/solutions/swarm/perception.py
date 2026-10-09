@@ -9,6 +9,7 @@ from typing import Iterable, Optional, Sequence
 
 import numpy as np
 
+from . import fusion
 from .config import Params
 from .schema import ObjKind, ObjState, Pose
 from .world import WorldModel
@@ -82,34 +83,48 @@ def drone_ray_mask(ranges, angles, semantic: Iterable) -> Optional[np.ndarray]:
     return mask
 
 
-def observe_semantic(world: WorldModel, pose: Pose, semantic: Sequence, t: int) -> dict:
-    """Détections sémantiques -> pistes d'objets. Renvoie ce qui est visible maintenant (pour les missions)."""
+def observe_semantic(world: WorldModel, pose: Pose, semantic: Sequence, t: int,
+                     params: Optional[Params] = None) -> dict:
+    """Détections sémantiques -> pistes d'objets avec covariance. Renvoie ce qui est visible maintenant
+    (pour les missions) : (position du centre, distance mesurée brute, état)."""
+    p = params or Params()
     seen = {"wounded": [], "rescue": []}
     pts = []
     for det in semantic:
         if det.kind not in seen or not np.isfinite(det.distance):
             continue
         ang = pose.theta + det.angle
-        reach = det.distance + (10.0 if det.kind == "rescue" else 0.0)    # centre de secours : 10 px à l'intérieur du bord vu
+        if det.kind == "wounded":            # surface vue -> centre du blessé, biais du capteur retiré
+            reach = det.distance - p.sem_dist_bias + p.wounded_radius
+        else:                                # centre de secours : 10 px à l'intérieur du bord vu
+            reach = det.distance + 10.0
         pos = pose.pos + reach * np.array((math.cos(ang), math.sin(ang)))
-        pts.append((det.kind, pos, det))
-    # un blessé est vu par plusieurs rayons : on regroupe à 25 px
+        pts.append((det.kind, pos, det, reach))
+    # un objet est vu par plusieurs rayons : on regroupe à 25 px
     merged = []
-    for kind, pos, det in pts:
+    for kind, pos, det, reach in pts:
         for g in merged:
             if g[0] == kind and np.linalg.norm(g[1] - pos) < 25.0:
-                g[2].append(det); break
+                g[2].append((det, pos, reach)); break
         else:
-            merged.append([kind, pos, [det]])
-    for kind, pos, dets in merged:
-        d = min(dets, key=lambda x: x.distance)
+            merged.append([kind, pos, [(det, pos, reach)]])
+    floor = 0.5 * float(pose.cov[0, 0] + pose.cov[1, 1])      # incertitude de MA pose : commune à mes observations
+    for kind, _, items in merged:
+        det, _, _ = min(items, key=lambda x: x[0].distance)
+        pos = np.mean([q for _, q, _ in items], axis=0)       # rayons voisins : moyenne des centres
+        reach = float(np.mean([r for _, _, r in items]))
+        bearing = float(np.mean([x.angle for x, _, _ in items]))
         if kind == "wounded":
-            carried = any(x.grasped for x in dets)
+            carried = any(x.grasped for x, _, _ in items)
             st = ObjState.CARRIED if carried else ObjState.SEEN
             if not carried:                    # un blessé porté par un autre : son porteur gère la piste
-                world.observe_object(ObjKind.WOUNDED, pos, t, st)
-            seen["wounded"].append((pos, d.distance, st))
+                R = fusion.meas_point_cov(pose.cov, pose.theta, reach, bearing, p.sem_sigma_r,
+                                          p.sem_sigma_b / math.sqrt(len(items)))
+                world.observe_object(ObjKind.WOUNDED, pos, t, st, cov=R, floor_var=floor)
+            seen["wounded"].append((pos, det.distance, st))
         elif kind == "rescue":
-            world.observe_object(ObjKind.RESCUE_CENTER, pos, t)
-            seen["rescue"].append((pos, d.distance))
+            # objet étendu (200 x 100 px) : chaque rayon voit un point différent du bord -> incertitude large
+            R = fusion.meas_point_cov(pose.cov, pose.theta, reach, bearing, 30.0, p.sem_sigma_b) + 900.0 * np.eye(2)
+            world.observe_object(ObjKind.RESCUE_CENTER, pos, t, cov=R, floor_var=floor)
+            seen["rescue"].append((pos, det.distance))
     return seen

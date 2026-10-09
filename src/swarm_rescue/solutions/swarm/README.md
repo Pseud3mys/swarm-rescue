@@ -24,6 +24,10 @@ Tests (sans le vrai simulateur) : `cd tests && PYTHONPATH=../solutions:. python3
 | `controller.py` | asservissement en vitesse, freinage, évitement | `Pose`, `Route`, lidar | `Command` |
 | `brain.py` | séquencement et événements (replanification, blocage, saisie/dépose) | tout | `Command`, `Packet` |
 | `drone.py` | seul fichier qui touche au simulateur | `DroneAbstract` | |
+| `network.py` | image du réseau radio (liens entendus / prévus, composantes) | `WorldModel` | |
+| `teamplan.py` | allocation globale (base, binômes meneur/suiveur, relais, blessés) par méthode hongroise | `PlanGrid`, `WorldModel` | `Mission` par drone |
+| `fusion.py` | gaussiennes 2D : forme information, fusion indépendante, retrait de sa contribution, intersection de covariances | | |
+| `../debug_view.py` | fenêtre Qt de debug (carte de chaque drone + vue essaim), `SWARM_DEBUG=0` pour la couper | | |
 
 Un pas : radio → EKF (+ amers) → carte/objets → mission+chemin (sur événement seulement) → vitesse → publication de l'état aux voisins.
 
@@ -51,3 +55,19 @@ Un pas : radio → EKF (+ amers) → carte/objets → mission+chemin (sur évén
 - Le recalage sur coins n'est actif que sans GPS (ou pose très incertaine) : avec un bon GPS il rendait le filtre trop confiant. Il dépend de la densité de coins ; dans mon arène de test les coins sont rares.
 - Non codé : zones de destruction / sans radio (les indices `DANGER_HINT`, `NOCOM_HINT` existent dans le schéma ; `extra_cost` de `PlanGrid` permet de les éviter), mission `RELAY` (drone central messager), évitement entre drones (seulement via lidar et surcoût autour des routes annoncées), blessés mobiles.
 - Aucun chiffre ici ne valide le comportement sur les vraies cartes.
+
+## Partage de perceptions fusionnées (en cours)
+Fait : chaque piste d'objet porte la covariance de l'estimation fusionnée de son propriétaire (Kalman avec
+plancher = incertitude de sa pose, commune à ses observations). La vue fusionnée combine les propriétaires
+par somme d'informations (biais de pose indépendants entre drones). Le modèle du capteur sémantique corrige
+son biais (+2,5 px) et vise le centre du blessé (surface + 12 px).
+
+À faire, dans l'ordre :
+1. Association par distance de Mahalanobis (au lieu du rayon fixe) et identifiant commun déterministe.
+2. Amers (coins) partagés avec covariance ; recalage de l'EKF sur « global moins ma contribution ».
+3. Localisation coopérative : détection sémantique des autres drones -> mesure de position pour eux
+   (intersection de covariances, surtout sans GPS).
+4. Comms : résumé compressé, diffusion poussée à durée de vie limitée des infos urgentes, priorité vers la base.
+   Le gossip actuel reste la garantie de convergence.
+5. Sous-réseaux : 2-3 groupes entiers, chacun connexe (aujourd'hui : excursions de binômes hors réseau).
+6. Routes de rapatriement partagées, puis retour du passage de relais (`handoff_enabled`).

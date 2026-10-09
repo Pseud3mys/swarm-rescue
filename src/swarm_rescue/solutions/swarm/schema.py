@@ -92,6 +92,7 @@ class ObjectTrack:
     pos: Vec
     t_seen: int
     state: ObjState
+    cov: tuple = (400.0, 0.0, 400.0)   # covariance de position (xx, xy, yy) de l'estimation FUSIONNÉE du propriétaire
 
     @property
     def key(self) -> tuple[int, int]:

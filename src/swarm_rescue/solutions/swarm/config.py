@@ -47,6 +47,13 @@ class Params:
     ev_free: int = -1
     ev_hit: int = 3
     max_pose_sigma_for_mapping: float = 14.0
+    # capteur sémantique (drone_semantic_sensor.py) : distance + N(2.5, 1) (biais +2,5 px, écart-type 1 :
+    # np.random.normal(2.5) prend 2.5 comme MOYENNE), angle exact mais discrétisé (35 rayons, 10,3°) ;
+    # la distance va jusqu'à la SURFACE du blessé (rayon 12)
+    sem_dist_bias: float = 2.5
+    sem_sigma_r: float = 2.0
+    sem_sigma_b: float = 0.05          # rad (~3° : écart-type d'une erreur uniforme de ±5°)
+    wounded_radius: float = 12.0
 
     # ---- planification --------------------------------------------------------------------------
     inflate_cells: int = 2             # gonflage des obstacles (cellules) : contrainte dure (16 px + rayon du drone)
@@ -90,7 +97,10 @@ class Params:
     grasp_dist: float = 32.0
     rescue_approach_dist: float = 120.0  # centre de secours vu plus près : on fonce dessus à vue (le blessé est sauvé au contact)
     rescue_approach_speed: float = 1.2
-    rescue_spin_dist: float = 30.0     # centre plus près que ça : on tourne sur place pour que le blessé le touche
+    rescue_spin_dist: float = 30.0     # centre plus près que ça ...
+    rescue_spin_after: int = 60        # ... depuis N pas sans sauvetage : on tourne sur place (secours si le cap ne suffit pas)
+    rot_gain: float = 3.0              # rotation = gain x erreur de cap (0,176 rad/pas pour 1 : gain 3 -> ~50 % par pas)
+    carry_track_period: int = 15       # pas : la piste du blessé porté suit le porteur
     # ---- saisie, priorités de passage, passage de relais du blessé ------------------------------
     grasp_close_dist: float = 60.0     # px : pince fermée dès cette distance (la saisie se fait au contact)
     approach_min_speed: float = 1.0    # px/pas : vitesse mini de l'approche finale (heurter un blessé ne coûte rien)

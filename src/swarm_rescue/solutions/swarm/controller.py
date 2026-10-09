@@ -133,7 +133,8 @@ class PathFollower:
         c, s = math.cos(pose.theta), math.sin(pose.theta)
         fwd = c * cmd_w[0] + s * cmd_w[1]
         lat = -s * cmd_w[0] + c * cmd_w[1]
-        rot = float(np.clip(_wrap(theta_ref - pose.theta) * 8.0, -1.0, 1.0)) if abs(_wrap(theta_ref - pose.theta)) > 0.03 else 0.0
+        err = _wrap(theta_ref - pose.theta)
+        rot = float(np.clip(err * p.rot_gain, -1.0, 1.0)) if abs(err) > 0.03 else 0.0
         return Command(float(fwd), float(lat), rot, grasp)
 
     def _clearance_cap(self, pose, ranges, angles, u, a_b) -> float:

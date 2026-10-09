@@ -176,13 +176,22 @@ class TeamPlanner:
             return plan
 
         # ---- coûts : Dijkstra depuis chaque cellule de créneau (une seule fois par cellule distincte)
+        # graphe non orienté : on lance les Dijkstra depuis le côté le moins nombreux (drones ou cellules de créneau)
         cells = sorted({s.cell for s in slots})
-        dmaps = dict(zip(cells, grid.dists_from(cells)))
+        acells = []
+        for _, pos, _ in agents:
+            c = grid.nearest_reachable(pos, radius=3)     # un drone collé au mur est dans le gonflage
+            acells.append(c if c is not None else grid.cell(pos))
+        if len(acells) <= len(cells):
+            dm = grid.dists_from(acells)
+            cost_of = lambda i, j: PlanGrid.lookup(dm[i], slots[j].cell, radius=1)
+        else:
+            dmaps = dict(zip(cells, grid.dists_from(cells)))
+            cost_of = lambda i, j: PlanGrid.lookup(dmaps[slots[j].cell], acells[i], radius=1)
         C = np.full((n, len(slots)), BIG)
         for i, (origin, pos, mission) in enumerate(agents):
-            acell = grid.cell(pos)
             for j, s in enumerate(slots):
-                c = PlanGrid.lookup(dmaps[s.cell], acell)
+                c = cost_of(i, j)
                 if not math.isfinite(c):
                     continue
                 if s.kind == "wounded":

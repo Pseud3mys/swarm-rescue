@@ -37,7 +37,7 @@ _DEBUG_VIEW = None   # fenêtre unique partagée par tous les drones (cf. debug_
 class SwarmDrone(DroneAbstract):
     # Debug (à couper pour la soumission, ou via la variable d'environnement SWARM_DEBUG=0) :
     DEBUG_VIEW = os.environ.get("SWARM_DEBUG", "1") != "0"   # fenêtre Qt avec la carte interne de chaque drone
-    DEBUG_PERIOD = 10                                        # rafraîchissement de cette fenêtre (pas)
+    DEBUG_PERIOD = 1                                         # la vue répartit elle-même son travail sur les pas
 
     def __init__(self, identifier=None, misc_data=None, **kwargs):
         super().__init__(identifier=identifier, misc_data=misc_data, **kwargs)

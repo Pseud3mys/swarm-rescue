@@ -10,6 +10,9 @@ import math
 from dataclasses import dataclass, replace
 from typing import Optional
 
+import numpy as np
+
+from . import fusion
 from .gridmap import ChunkedMap
 from .schema import (AgentState, Digest, Mission, ObjKind, ObjState, ObjectTrack, Vec,
                      Waypoint)
@@ -39,6 +42,7 @@ class FusedObject:
     state: ObjState
     sources: tuple[tuple[int, int], ...]
     t_carried: int = -1     # dernier instant où un drone le portait (-1 : jamais)
+    cov: tuple = (400.0, 0.0, 400.0)   # covariance de la position fusionnée
 
 
 class WorldModel:
@@ -62,8 +66,10 @@ class WorldModel:
         return a
 
     def observe_object(self, kind: ObjKind, pos, t: int,
-                       state: ObjState = ObjState.SEEN) -> ObjectTrack:
-        """Crée ou met à jour MA piste la plus proche de même nature."""
+                       state: ObjState = ObjState.SEEN, cov=None, floor_var: float = 0.0) -> ObjectTrack:
+        """Crée ou met à jour MA piste la plus proche de même nature.
+        Avec `cov` (covariance 2x2 de la mesure, monde) : filtre de Kalman sur la position, avec un plancher
+        `floor_var` (incertitude de MA pose, commune à toutes mes observations : elle ne se moyenne pas)."""
         pos = (float(pos[0]), float(pos[1]))
         best, best_d = None, CLUSTER_RADIUS[kind]
         for tr in self.objects.values():
@@ -72,16 +78,25 @@ class WorldModel:
                 if d <= best_d:
                     best, best_d = tr, d
         if best is None:
-            tr = ObjectTrack(self.me, self._next_local, 1, kind, pos, t, state)
+            c0 = fusion.cov_pack(cov) if cov is not None else ObjectTrack.cov
+            tr = ObjectTrack(self.me, self._next_local, 1, kind, pos, t, state, c0)
             self._next_local += 1
         else:
-            a = 0.0 if state == ObjState.CARRIED else SMOOTH.get(kind, 1.0)   # un blessé porté ne déplace pas sa piste
             new_state = ObjState.RESCUED if best.state == ObjState.RESCUED else state
-            new_pos = (best.pos[0] + a * (pos[0] - best.pos[0]), best.pos[1] + a * (pos[1] - best.pos[1]))
+            new_cov = best.cov
+            if state == ObjState.CARRIED:                   # un blessé porté ne déplace pas sa piste ici
+                new_pos = best.pos
+            elif cov is not None:
+                mu, P = fusion.kalman_update(best.pos, fusion.cov_unpack(best.cov), pos, cov, floor_var)
+                new_pos, new_cov = (float(mu[0]), float(mu[1])), fusion.cov_pack(P)
+            else:
+                a = SMOOTH.get(kind, 1.0)
+                new_pos = (best.pos[0] + a * (pos[0] - best.pos[0]), best.pos[1] + a * (pos[1] - best.pos[1]))
             moved = math.hypot(new_pos[0] - best.pos[0], new_pos[1] - best.pos[1])
-            if new_state == best.state and moved < 1.5 and t - best.t_seen < 30:
+            shrunk = new_cov[0] + new_cov[2] < 0.8 * (best.cov[0] + best.cov[2])
+            if new_state == best.state and moved < 1.5 and not shrunk and t - best.t_seen < 30:
                 return best      # rien de neuf : pas de nouvelle révision (évite d'inonder le gossip)
-            tr = replace(best, rev=best.rev + 1, pos=new_pos, t_seen=t, state=new_state)
+            tr = replace(best, rev=best.rev + 1, pos=new_pos, t_seen=t, state=new_state, cov=new_cov)
         self.objects[tr.key] = tr
         self.version += 1
         return tr
@@ -94,6 +109,16 @@ class WorldModel:
         if tr.state == ObjState.RESCUED:
             return tr
         tr = replace(tr, rev=tr.rev + 1, t_seen=t, state=state)
+        self.objects[key] = tr
+        self.version += 1
+        return tr
+
+    def move_track(self, key, pos, t: int) -> Optional[ObjectTrack]:
+        """Déplace une de MES pistes (blessé porté : il est là où je suis)."""
+        tr = self.objects.get(key)
+        if tr is None or tr.origin != self.me or tr.state == ObjState.RESCUED:
+            return tr
+        tr = replace(tr, rev=tr.rev + 1, pos=(float(pos[0]), float(pos[1])), t_seen=t)
         self.objects[key] = tr
         self.version += 1
         return tr
@@ -129,6 +154,13 @@ class WorldModel:
 
     # ---- lecture ---------------------------------------------------------
     def objects_view(self, kind: Optional[ObjKind] = None) -> list[FusedObject]:
+        """Vue fusionnée, mise en cache jusqu'au prochain changement de la table d'objets."""
+        key = (self.version, kind)
+        if getattr(self, "_view_key", None) != key:
+            self._view_key, self._view_val = key, self._objects_view(kind)
+        return self._view_val
+
+    def _objects_view(self, kind: Optional[ObjKind]) -> list[FusedObject]:
         clusters: list[list[ObjectTrack]] = []
         for tr in sorted(self.objects.values(), key=lambda o: -o.t_seen):
             if kind is not None and tr.kind != kind:
@@ -148,9 +180,27 @@ class WorldModel:
                 st = ObjState.RESCUED
             else:
                 st = max(c, key=lambda x: x.t_seen).state          # l'observation la plus récente décide
-            out.append(FusedObject(c[0].kind, c[0].pos, c[0].t_seen, st, tuple(x.key for x in c),
-                                   max([x.t_seen for x in c if x.state == ObjState.CARRIED], default=-1)))
+            pos, cov = self._fuse_cluster(c)
+            out.append(FusedObject(c[0].kind, pos, c[0].t_seen, st, tuple(x.key for x in c),
+                                   max([x.t_seen for x in c if x.state == ObjState.CARRIED], default=-1), cov))
         return out
+
+    @staticmethod
+    def _fuse_cluster(c: list) -> tuple:
+        """Position d'un objet vu par plusieurs drones : fusion bayésienne des estimations de chaque propriétaire
+        (indépendantes entre drones : biais de pose différents). Une seule estimation par propriétaire (la plus
+        récente). Un blessé porté (piste CARRIED la plus récente) est là où est son porteur : on prend sa piste."""
+        latest = max(c, key=lambda x: x.t_seen)
+        if latest.state == ObjState.CARRIED or len(c) == 1:
+            return latest.pos, latest.cov
+        per_origin = {}
+        for x in c:
+            if x.state != ObjState.CARRIED and (x.origin not in per_origin or x.t_seen > per_origin[x.origin].t_seen):
+                per_origin[x.origin] = x
+        if not per_origin:
+            return latest.pos, latest.cov
+        mu, P = fusion.fuse_independent((np.array(x.pos), fusion.cov_unpack(x.cov)) for x in per_origin.values())
+        return (float(mu[0]), float(mu[1])), fusion.cov_pack(P)
 
     def others(self) -> list[AgentState]:
         return [a for o, a in self.agents.items() if o != self.me]

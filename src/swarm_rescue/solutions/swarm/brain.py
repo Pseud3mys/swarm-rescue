@@ -71,6 +71,11 @@ class Brain:
         self._handoff_release = False   # le lâcher en cours est un passage de relais (pas une dépose)
         self._recv_since = 0
         self._wait_since = None         # début de l'attente en file (même sens, drone devant)
+        # Pince = PivotJoint fixé dans le repère du drone : le blessé reste du côté où on l'a saisi.
+        # Il devient invisible aux capteurs une fois saisi, mais cet angle (repère drone) reste valable.
+        self._wounded_bearing = None    # relèvement (repère drone) du blessé visé pendant l'approche
+        self._carry_bearing = math.pi   # relèvement du blessé porté (repère drone)
+        self._rc_close_since = None
         self._no_wait_until = -1
         self._last_follow = -10 ** 9
         self.timing = {"est": 0.0, "map": 0.0, "plan": 0.0, "ctl": 0.0, "n_plan": 0}
@@ -93,7 +98,8 @@ class Brain:
         self.ekf.update_compass(f.compass)
         if not self.ekf.initialized:
             return Command()
-        if f.lidar is not None and t % 2 == 0:
+        # amers : utiles surtout sans GPS ; avec GPS on les entretient à faible cadence (calcul)
+        if f.lidar is not None and t % (2 if f.gps is None else 6) == 0:
             self.landmarks.process(t, f.lidar, f.angles)
         pose = self.ekf.pose()
         if self.theta_ref is None:
@@ -104,9 +110,9 @@ class Brain:
         if not self._home_set and f.in_return_area:
             w.observe_object(ObjKind.RETURN_AREA, pose.pos, t)
             self._home_set = True
-        if f.lidar is not None:
+        if f.lidar is not None and t % 2 == 0:       # un scan sur deux suffit (on bouge de < 5 px par pas)
             self.scan.integrate(pose, f.lidar, f.angles, drone_ray_mask(f.lidar, f.angles, f.semantic))
-        seen = observe_semantic(w, pose, f.semantic, t)
+        seen = observe_semantic(w, pose, f.semantic, t, p)
         t2 = T()
 
         # ---- mission / chemin
@@ -118,6 +124,7 @@ class Brain:
                     tr = w.observe_object(ObjKind.WOUNDED, pose.pos, t, ObjState.SEEN)
                 self._carry_key = tr.key
                 self._carry_since = t
+                self._carry_bearing = self._wounded_bearing if self._wounded_bearing is not None else math.pi
                 w.set_state(tr.key, ObjState.CARRIED, t)
             elif self._handoff_release:                            # passé à un autre drone : sa piste prend le relais
                 self._handoff_release = False
@@ -127,6 +134,9 @@ class Brain:
                 self._carry_key = None
             self._grasp = 1 if f.carrying else 0
             self._was_carrying = f.carrying
+        if f.carrying and self._carry_key is not None and t % p.carry_track_period == 0:
+            a = pose.theta + self._carry_bearing                # la piste suit le blessé, donc le porteur
+            w.move_track(self._carry_key, pose.pos + 25.0 * np.array((math.cos(a), math.sin(a))), t)
         self._handoff_logic(t, pose, f)
         reason = self._replan_reason(t, pose, f, seen)
         if reason:
@@ -164,7 +174,7 @@ class Brain:
             if n != self._n_free_wounded:
                 self._n_free_wounded = n
                 return "wounded-change"
-        if self.route is not None and t % 3 == 0:
+        if self.route is not None and t % 6 == 0:
             if self._route_blocked(pose):
                 return "blocked"
             goal = np.array(self.route.goal) if self.route.goal else None
@@ -419,6 +429,7 @@ class Brain:
                 pos, d = min(vis, key=lambda x: x[1])
                 if d < 90.0:                                       # approche finale à vue, jusqu'au contact
                     override_dir, override_speed, lidar = self._approach(pose, pos, d, f)
+                    self._wounded_bearing = math.atan2(override_dir[1], override_dir[0]) - pose.theta
                     if d < p.grasp_close_dist:
                         self._grasp, self._grasp_since = 1, t
             elif np.linalg.norm(tgt - pose.pos) < 35.0:
@@ -471,9 +482,14 @@ class Brain:
                 override_dir = to / max(float(np.linalg.norm(to)), 1e-6)
                 override_speed = p.rescue_approach_speed
                 repulse = False
-                # Collé au centre : le blessé (PivotJoint) traîne derrière nous et ne le touche pas.
-                # En tournant sur nous-mêmes, le point de pivot fait orbiter le blessé, qui balaie le centre.
-                spin = d < p.rescue_spin_dist
+                # Le blessé est tourné VERS le centre (cap réglé plus bas) : c'est lui qui touche en premier.
+                # Secours : si on est collé depuis longtemps sans sauvetage, on tourne sur place (le pivot fait
+                # orbiter le blessé, qui balaie le centre).
+                if d < p.rescue_spin_dist:
+                    self._rc_close_since = t if self._rc_close_since is None else self._rc_close_since
+                    spin = t - self._rc_close_since > p.rescue_spin_after
+                else:
+                    self._rc_close_since = None
 
         # meneur d'un binôme : il attend son suiveur s'il le distance (la radio doit passer entre eux)
         if self.mission.kind == MissionKind.EXPLORE and not f.carrying:
@@ -519,6 +535,16 @@ class Brain:
                 self.planner.ban(self.mission.target, t + 400)
             override_dir, override_speed = self._recover_dir, 1.0
             spin = f.carrying
+
+        if f.carrying and not spin:
+            # cap du porteur : blessé DERRIÈRE nous dans le sens de la marche (il suit la trajectoire au lieu
+            # d'accrocher les murs dans les virages), DEVANT nous à l'approche du centre de secours
+            if override_dir is not None and not repulse:
+                self.theta_ref = _wrap_angle(math.atan2(override_dir[1], override_dir[0]) - self._carry_bearing)
+            else:
+                u = override_dir if override_dir is not None else self._my_dir(pose)
+                if u is not None:
+                    self.theta_ref = _wrap_angle(math.atan2(-u[1], -u[0]) - self._carry_bearing)
 
         end_stop = self.mission.kind in (MissionKind.EXPLORE, MissionKind.CARRY, MissionKind.GOTO_WOUNDED,
                                          MissionKind.RETURN, MissionKind.IDLE, MissionKind.RELAY, MissionKind.FOLLOW)
@@ -595,3 +621,7 @@ def _closest_on_polyline(P: np.ndarray, x: np.ndarray):
         if d < bd:
             best, bd = q, d
     return best, bd
+
+
+def _wrap_angle(a: float) -> float:
+    return (a + math.pi) % (2 * math.pi) - math.pi
