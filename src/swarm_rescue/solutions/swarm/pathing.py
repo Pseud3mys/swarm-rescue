@@ -39,7 +39,10 @@ class Frontier:
 
 class PlanGrid:
     def __init__(self, world: WorldModel, params: Params, start_xy, inflate: Optional[int] = None,
-                 extra_cost: Optional[np.ndarray] = None):
+                 extra_cost: Optional[np.ndarray] = None, free_start: bool = True):
+        """`free_start` : la cellule de départ (le drone) et son voisinage sont libres par définition. False (grille
+        d'équipe, départ = base) : on part de la cellule traversable la plus proche, sans rien modifier — la grille ne
+        dépend alors que de la carte, et tous les drones d'un réseau calculent la même."""
         self.world, self.p = world, params
         m = world.map
         self.m = m
@@ -59,10 +62,18 @@ class PlanGrid:
         else:
             blocked = closed > 0
         blocked |= ~arena
-        # la cellule du drone et son voisinage immédiat sont libres par définition
         self.start = tuple(int(v[0]) for v in m.world_to_cell(start_xy))
         sx, sy = self.start
-        blocked[max(sx - 2, 0):sx + 3, max(sy - 2, 0):sy + 3] = False
+        if free_start:      # la cellule du drone et son voisinage immédiat sont libres par définition
+            blocked[max(sx - 2, 0):sx + 3, max(sy - 2, 0):sy + 3] = False
+        elif blocked[sx, sy] or not self.free[sx, sy]:
+            # cellule traversable ET connue libre la plus proche (une cellule inconnue peut être une poche fermée,
+            # par exemple l'intérieur du centre de secours, dont le Dijkstra ne sortirait pas)
+            ok = ~blocked & self.free
+            fx, fy = np.nonzero(ok if ok.any() else ~blocked)
+            if fx.size:
+                k = int(np.argmin((fx - sx) ** 2 + (fy - sy) ** 2 + 1e-3 * (fx * self.H + fy) / (self.W * self.H)))
+                self.start = (int(fx[k]), int(fy[k]))
         self.blocked = blocked
         unknown = arena & ~self.free & (closed == 0)
         self.unknown = unknown
@@ -71,6 +82,7 @@ class PlanGrid:
         rw = params.wall_cost_cells
         prox = np.clip((rw - d) / rw, 0.0, 1.0) ** 2 * params.wall_cost
         self.los_max_cost = 1.0 + params.wall_cost * ((rw - params.los_wall_cells) / rw) ** 2
+        self._open_cost = 1.0 + params.wall_cost * (1.0 / rw) ** 2   # ~5 cellules d'un mur : déjà le milieu d'un couloir
         cost = 1.0 + prox
         cost = np.where(unknown, cost * params.unknown_cost, cost)
         if extra_cost is not None:
@@ -171,11 +183,18 @@ class PlanGrid:
         return list(zip((a // H).tolist(), (a % H).tolist()))
 
     def _los(self, a, b) -> bool:
+        """Raccourci autorisé si la ligne reste traversable ET ne s'approche pas plus des murs que ses extrémités :
+        la route garde l'axe des couloirs et des portes trouvé par Dijkstra (frôler un mur fausse le lidar et
+        accroche le drone) ; en terrain dégagé (coût minimal) les raccourcis restent libres."""
         n = int(max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 2) + 1
         t = np.linspace(0.0, 1.0, n + 1)
         xs = np.rint(a[0] + (b[0] - a[0]) * t).astype(int)
         ys = np.rint(a[1] + (b[1] - a[1]) * t).astype(int)
-        return bool(self.trav[xs, ys].all() and not (self.cost[xs, ys] > self.los_max_cost).any())
+        if not self.trav[xs, ys].all():
+            return False
+        c = self.cost[xs, ys]
+        lim = min(max(float(c[0]), float(c[-1]), self._open_cost) + 0.05, self.los_max_cost)
+        return not (c > lim).any()
 
     def path_cells(self, cell, pred, src_cell) -> Optional[list]:
         """Chemin (liste de cellules, non simplifié) de `src_cell` à `cell` d'après un arbre de tree_from()."""
@@ -202,15 +221,30 @@ class PlanGrid:
 
     def _simplify(self, cells: list) -> list:
         """Raccourcis par ligne de vue sur la grille gonflée (supprime le zigzag du 8-connexe)."""
+        # point le plus loin visible : pas exponentiels puis dichotomie (~10 tests au lieu de 60)
         out = [cells[0]]
         i = 0
         n = len(cells)
         while i < n - 1:
-            j = min(n - 1, i + 60)
-            while j > i + 1 and not self._los(cells[i], cells[j]):
-                j -= 1
-            out.append(cells[j])
-            i = j
+            lo, step = i + 1, 2                              # lo : toujours visible (voisin direct)
+            hi = None
+            while lo < min(n - 1, i + 60):
+                j = min(i + step, n - 1, i + 60)
+                if self._los(cells[i], cells[j]):
+                    lo = j
+                    step *= 2
+                else:
+                    hi = j
+                    break
+            if hi is not None:
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if self._los(cells[i], cells[mid]):
+                        lo = mid
+                    else:
+                        hi = mid
+            out.append(cells[lo])
+            i = lo
         return out
 
     # ------------------------------------------------------------------ frontières

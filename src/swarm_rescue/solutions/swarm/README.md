@@ -25,7 +25,7 @@ Tests (sans le vrai simulateur) : `cd tests && PYTHONPATH=../solutions:. python3
 | `brain.py` | séquencement et événements (replanification, blocage, saisie/dépose) | tout | `Command`, `Packet` |
 | `drone.py` | seul fichier qui touche au simulateur | `DroneAbstract` | |
 | `network.py` | image du réseau radio (liens entendus / prévus, composantes) | `WorldModel` | |
-| `teamplan.py` | allocation globale (base, binômes meneur/suiveur, relais, blessés) par méthode hongroise | `PlanGrid`, `WorldModel` | `Mission` par drone |
+| `teamplan.py` | allocation par réseau connexe : dépose, meneurs (le plus proche, en profondeur), relais derrière eux, suiveurs, blessés/base (hongrois) | `PlanGrid`, `WorldModel` | `Mission` par drone |
 | `topo.py` | carte topologique : pièces / portes / couloirs (ouverture morphologique), arbre depuis la base, axes de passage | `PlanGrid` | `TopoMap` |
 | `fusion.py` | gaussiennes 2D : forme information, fusion indépendante, Kalman à plancher, Mahalanobis | | |
 | `../debug_view.py` | fenêtre Qt de debug (carte de chaque drone + vue essaim), `SWARM_DEBUG=0` pour la couper | | |
@@ -108,15 +108,37 @@ Méthode « deux échelles » du prototype segproto.py :
   (MapMedium02, plans de deux drones à moins de 3 pas d'écart) : 87 % des désaccords d'allocation venaient de créneaux
   différents, dont près de la moitié de cette seule position ; les cartes, elles, concordent à > 99 % là où les deux
   drones savent. Le reste vient de connaissances différentes (frontières vues par l'un seulement, drones hors portée).
-- Utilisée par teamplan : relais et réserve jamais sur un axe ni sur la route des explorateurs ; un meneur garde
-  sa région tant qu'elle est ouverte ; pénalité de changement de rôle vers un blessé hors de sa région.
-- À faire : partager les PASSAGES (position, largeur) comme les coins, pas la segmentation ; chaque drone recalcule
-  ses pièces localement. Valider sur les autres cartes (MapMedium01, finales). `touches_unknown` est trop sensible
-  aux petits trous d'inconnu le long des murs (le planificateur utilise les frontières, pas ce drapeau).
+- Validation sur la vérité terrain de toutes les cartes (scratch `topo_check.py`) : correcte sur MapMedium01 et les
+  cartes à murs droits ; défauts : un couloir est découpé et absorbé par les pièces voisines à travers les portes
+  (2023_24_03), fragmentation près des murs diagonaux (2023_24_02, 2024_25_02). L'intérieur des murs doubles forme
+  des régions hors arbre, sans conséquence. Partager les passages : peu utile (topologie recalculée au même pas par tous).
 
-## Prochaine séance : ramener le blessé à la porte
-Un explorateur qui trouve un blessé dans une pièce le porte jusqu'à l'arête d'entrée de la pièce (vers le parent
-dans l'arbre, à côté de l'axe pour ne pas le boucher), le dépose, et reprend l'exploration ; un drone de la chaîne
-le reprend. S'il n'y a plus rien à explorer, il le ramène jusqu'à la base. Briques déjà là : `TopoMap.regions[r].parent/link`,
-pierre tombale `ObjState.TAKEN` (la position de saisie est effacée, la dépose crée une observation nouvelle).
-Résumé radio d'une pièce explorée (contour + statut) à la place de ses tuiles : à faire avec l'étape comms.
+## Planification d'équipe (teamplan.py) et exploration
+Causes mesurées des défauts de l'ancienne allocation (MapMedium02 et finale 2024_25_02) : chaque frontière exigeait une
+chaîne de relais complète depuis la base (2,5 à 3 relais + 1 à 1,8 drones garés par plan, 46-49 % du temps en relais) ;
+la méthode hongroise sur la somme des coûts échangeait le drone de tête avec un plus lointain (30 % des créneaux meneur
+avaient un relais plus proche : « tête devenue relais », relais devant l'explorateur) ; frontières prises par distance à
+la base (exploration en largeur) ; grille, liste noire et topologie propres à chaque drone (plans divergents).
+
+Nouvelle allocation, par réseau connexe (`component` : liens entendus ou distance < 240 px entre positions extrapolées ;
+positions dans le réseau : 3 pas d'âge médian, 7-10 au 90e centile ; hors réseau : 45-150 pas) :
+1. dépose (`DROP`) : un meneur qui QUITTE une pièce finie contenant un blessé le pose devant la porte, côté pièce
+   parente, hors de l'axe ; un autre drone (relais, base, libre) le ramène à la base (`brain._refresh_explore`) ;
+2. meneurs : glouton « le plus proche d'abord » sur le coût de chemin, bonus pour finir sa pièce et garder sa voie,
+   frontières réservées par les drones d'autres réseaux pénalisées ; `lane_share` = 50 % des drones libres ;
+3. relais : chaîne base -> meneur tous les 200 px, JAMAIS au-delà du meneur, décalés jusqu'à 64 px hors des passages
+   et des routes (la radio traverse les murs) ;
+4. suiveurs : le drone libre le plus proche de chaque meneur ; drones en trop -> meneurs supplémentaires ;
+5. blessés, relais, base : hongrois sur les drones restants.
+Grille d'équipe commune (depuis la base, sans surcoût autour des drones), pas de liste noire dans le plan (un drone
+qui a échoué sur une cible y renonce lui-même), topologie recalculée à `t // topo_period`.
+Exploration : un meneur recible toutes les 10 pas le bord ouvert le plus proche de lui (il suit l'ouvert au lieu de viser
+un point fixe) ; routes au milieu des couloirs et des portes (un raccourci ne s'approche pas plus des murs que ses
+extrémités). Lidar : un ou deux rayons qui « traversent » un mur entre deux impacts distants de < 28 px sont corrigés
+en impact (`perception.fill_lidar_holes`) : sinon un trou gravé dans le mur attirait la route le long du mur.
+Mesures (1 essai chacune) : MapMedium02 1000 pas : désaccord des créneaux meneur 24 -> 8 %, meneur le plus proche
+47 -> 75 %, temps d'exploration x2 ; finale 2024_25_02 1500 pas : exploration 38 -> 68 %, relais sur une route 22 -> 0 %.
+Contrepartie : réseau moins connexe (5 drones par réseau au lieu de 8) ; `lane_share` règle le compromis.
+Avec la dépose à la porte (déclenchée quand le meneur quitte la pièce) : finale 1500 pas : exploration 49 % (68 % sans
+dépose, 38 % ancien code), trajets vers des blessés x6 (blessés déposés + 1/3 des drones libres réservés aux blessés),
+toujours 4/19 sauvés. Un seul essai par configuration : à confirmer sur plusieurs graines et sur une partie complète.

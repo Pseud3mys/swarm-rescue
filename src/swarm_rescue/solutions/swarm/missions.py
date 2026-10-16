@@ -35,13 +35,24 @@ class MissionPlanner:
         h = self.w.objects_view(ObjKind.RETURN_AREA)
         return np.array(h[0].pos) if h else None
 
+    def return_box(self) -> Optional[tuple]:
+        """Zone de retour approchée : boîte des positions de départ de tous les drones (tous partent dedans ; chaque
+        drone publie la sienne, objet RETURN_AREA), élargie de 20 px. None si inconnue."""
+        pts = [o.pos for o in self.w.objects.values() if o.kind == ObjKind.RETURN_AREA]
+        if not pts:
+            return None
+        P = np.array(pts, float)
+        return P.min(axis=0) - 20.0, P.max(axis=0) + 20.0
+
     def rescue_point(self) -> Optional[np.ndarray]:
         r = self.w.objects_view(ObjKind.RESCUE_CENTER)
         return np.array(r[0].pos) if r else self.home()
 
     def candidates(self, t: int, pose: Pose, grid: PlanGrid, carrying: bool,
-                   current: Optional[Mission]) -> list[Mission]:
-        """Missions possibles par ordre de préférence (l'appelant prend la première qui a un chemin)."""
+                   current: Optional[Mission], taken=()) -> list[Mission]:
+        """Missions possibles par ordre de préférence (l'appelant prend la première qui a un chemin).
+        `taken` : cibles (blessés, frontières) que le plan d'équipe donne à d'AUTRES drones : jamais reprises ici
+        (sinon un drone sans ligne dans le plan, ou dont la route a échoué, fonçait sur le premier blessé connu)."""
         p, w = self.p, self.w
         out: list[Mission] = []
         if carrying:
@@ -61,7 +72,7 @@ class MissionPlanner:
             if o.state == ObjState.CARRIED and carriers:
                 continue
             pos = np.array(o.pos)
-            if self._banned(pos, t):
+            if self._banned(pos, t) or any(np.linalg.norm(pos - q) < 50.0 for q in taken):
                 continue
             mine = grid.cost_to(pos)
             if not math.isfinite(mine):
@@ -95,6 +106,8 @@ class MissionPlanner:
             if self._banned(c, t):
                 continue
             eff = f.cost
+            if any(np.linalg.norm(c - q) < 150.0 for q in taken):
+                eff += 250.0                                         # frontière donnée à un autre par le plan
             if any(np.linalg.norm(c - q) < 160.0 for q in explore_targets):
                 eff += 250.0                                         # un autre drone y va déjà
             if current and current.kind == MissionKind.EXPLORE and current.target \

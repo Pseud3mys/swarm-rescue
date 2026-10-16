@@ -79,6 +79,10 @@ class Brain:
         self._no_wait_until = -1
         self._last_follow = -10 ** 9
         self._cleared: set = set()      # blessés dont les impacts lidar ont été effacés de ma couche
+        self._drop_release = False      # le lâcher en cours est une dépose volontaire devant une porte
+        self._last_explore = -10 ** 9
+        self.mission_src = "start"
+        self._no_follow: dict = {}      # meneur -> pas jusqu'auquel je ne le suis plus (un autre suiveur est mieux placé)
         self.timing = {"est": 0.0, "map": 0.0, "plan": 0.0, "ctl": 0.0, "n_plan": 0}
 
     # ------------------------------------------------------------------ interface
@@ -134,6 +138,13 @@ class Brain:
             elif self._handoff_release:                            # passé à un autre drone : sa piste prend le relais
                 self._handoff_release = False
                 self._carry_key = None
+            elif self._drop_release and self._carry_key is not None:   # déposé exprès devant la porte : reste à prendre
+                self._drop_release = False
+                w.move_track(self._carry_key, pose.pos + 25.0 * np.array((math.cos(pose.theta + self._carry_bearing),
+                                                                          math.sin(pose.theta + self._carry_bearing))), t)
+                w.set_state(self._carry_key, ObjState.SEEN, t)
+                self._carry_key = None
+                self.mission = Mission(MissionKind.IDLE)
             elif self._carry_key is not None:                      # dépose : verdict après quelques pas (cf. _control)
                 self._pending_drop = (self._carry_key, t + self.p.drop_check_steps, t)
                 self._carry_key = None
@@ -143,12 +154,16 @@ class Brain:
             a = pose.theta + self._carry_bearing                # la piste suit le blessé, donc le porteur
             w.move_track(self._carry_key, pose.pos + 25.0 * np.array((math.cos(a), math.sin(a))), t)
         self._handoff_logic(t, pose, f)
+        if t % 3 == 0 and not f.carrying:
+            self._resolve_conflicts(t, pose)
         reason = self._replan_reason(t, pose, f, seen)
         if reason:
             self.last_reason = reason
             self._replan(t, pose, f)
         elif self.mission.kind in (MissionKind.FOLLOW, MissionKind.RECEIVE) and t - self._last_follow >= p.follow_replan:
             self._refresh_follow(t, pose, f)
+        elif self.mission.kind == MissionKind.EXPLORE and not f.carrying and t - self._last_explore >= p.explore_refresh:
+            self._refresh_explore(t, pose, f)
         t3 = T()
 
         # ---- asservissement
@@ -204,7 +219,7 @@ class Brain:
     # ------------------------------------------------------------------ événements de replanification
     def _replan_reason(self, t, pose, f, seen) -> Optional[str]:
         p = self.p
-        if self._plan_reason in ("carry-change", "stuck"):
+        if self._plan_reason in ("carry-change", "stuck", "conflict"):
             r, self._plan_reason = self._plan_reason, ""
             return r
         if self.route is None and t - self._last_plan >= 10:
@@ -222,6 +237,9 @@ class Brain:
             goal = np.array(self.route.goal) if self.route.goal else None
             if goal is not None and self.mission.kind in (MissionKind.EXPLORE, MissionKind.RETURN) \
                     and np.linalg.norm(goal - pose.pos) < 22.0:
+                if self.mission.kind == MissionKind.EXPLORE:
+                    self._last_explore = -10 ** 9          # meneur arrivé : il recible le bord ouvert suivant
+                    return None
                 return "arrived"
         return None
 
@@ -258,20 +276,45 @@ class Brain:
             return
         extra = extra_cost_from_agents(w, t, w.map, (w.map.W, w.map.H), self.me)
         route, chosen = None, None
-        team_mission = None
         # porteur : le blessé dépasse du drone, on planifie avec plus de marge aux murs (repli si injoignable)
         inflates = (p.inflate_cells_carry, None, p.inflate_cells_tight) if f.carrying else (None, p.inflate_cells_tight)
+        # dépose en cours : on la termine (aller prendre le blessé, puis le porter devant la porte)
+        if self.mission.kind == MissionKind.DROP and self.mission.dest is not None:
+            goal = self.mission.dest if f.carrying else self.mission.target
+            for k in inflates:
+                grid = PlanGrid(w, p, pose.pos, inflate=k, extra_cost=extra)
+                grid.solve()
+                route = grid.route_to(goal, t, self._speed(f.carrying))
+                if route is not None:
+                    break
+            if route is not None:
+                self.route = route
+                self.follower.set_route(route)
+                self._arrived_t = None
+                self._stuck = 0
+                self.mission_src = "drop"
+                self.timing["n_plan"] += 1
+                return
+            if not f.carrying:
+                self.planner.ban(self.mission.target, t + 400)     # injoignable : on renonce, l'équipe s'en chargera
+        team_mission = None
+        taken = []
+        if not f.carrying:                                     # allocation d'équipe (grille commune, calculée à part)
+            plan = self.team.plan(t, pose, self.mission)
+            team_mission = plan.missions.get(self.me) if plan is not None else None
+            taken = plan.taken_by_others(self.me) if plan is not None else []
+            if team_mission is not None and team_mission.kind == MissionKind.FOLLOW \
+                    and self._no_follow.get(team_mission.peer, -1) > t:
+                team_mission = None             # un autre suiveur est plus près de ce meneur : je laisse
+            if team_mission is not None and team_mission.target is not None \
+                    and team_mission.kind in (MissionKind.EXPLORE, MissionKind.GOTO_WOUNDED, MissionKind.DROP) \
+                    and self.planner._banned(np.array(team_mission.target), t):
+                team_mission = None             # j'y ai déjà échoué : je laisse cette tâche (choix individuel)
         for k in inflates:
             grid = PlanGrid(w, p, pose.pos, inflate=k, extra_cost=extra)
             grid.solve()
-            cands = []
-            if not f.carrying:
-                if k is None:                                  # allocation d'équipe : une fois, sur la grille nominale
-                    plan = self.team.plan(t, pose, grid, self.mission)
-                    team_mission = plan.missions.get(self.me) if plan is not None else None
-                if team_mission is not None:
-                    cands.append(team_mission)
-            cands += self.planner.candidates(t, pose, grid, f.carrying, self.mission)   # repli : choix individuel
+            cands = [team_mission] if team_mission is not None and k is None else []
+            cands += self.planner.candidates(t, pose, grid, f.carrying, self.mission, taken)   # repli individuel
             for cand in cands:
                 if cand.target is None:
                     if cand.kind == MissionKind.IDLE:
@@ -287,6 +330,9 @@ class Brain:
             if chosen is not None:
                 break
         self.mission = chosen or Mission(MissionKind.IDLE)
+        # origine de la mission (debug / mesures) : plan d'équipe, repli individuel faute de route, ou pas de ligne
+        self.mission_src = ("carry" if f.carrying else "team" if chosen is not None and chosen is team_mission
+                            else "fallback" if team_mission is not None else "no-team")
         if f.carrying and self._handoff is not None and self.mission.kind == MissionKind.CARRY:
             self.mission = replace(self.mission, peer=self._handoff["peer"])   # demande de relais toujours annoncée
         self.route = route
@@ -294,6 +340,7 @@ class Brain:
         self._arrived_t = None
         self._stuck = 0
         self._last_follow = t
+        self._last_explore = t
         self.timing["n_plan"] += 1
 
     def _route_for(self, grid, cand, t, pose, carrying) -> Optional[Route]:
@@ -371,7 +418,7 @@ class Brain:
     # ------------------------------------------------------------------ priorités de passage
     @staticmethod
     def _prio(kind) -> int:
-        return {MissionKind.CARRY: 5, MissionKind.RECEIVE: 4, MissionKind.GOTO_WOUNDED: 3,
+        return {MissionKind.CARRY: 5, MissionKind.DROP: 4, MissionKind.RECEIVE: 4, MissionKind.GOTO_WOUNDED: 3,
                 MissionKind.EXPLORE: 2, MissionKind.FOLLOW: 2, MissionKind.RETURN: 1,
                 MissionKind.RELAY: 1}.get(kind, 0)
 
@@ -431,6 +478,92 @@ class Brain:
         n = float(np.linalg.norm(v))
         return v / n if n > 1e-6 else None
 
+    def _resolve_conflicts(self, t, pose) -> None:
+        """Doublons vus dans les missions ANNONCÉES par les autres (chaque drone publie à chaque pas sa mission : type,
+        cible, pair ; à jour à quelques pas près dans le réseau) : deux drones vers le même blessé, deux suiveurs du
+        même meneur. Règle commune à tous : le plus proche de la cible (à égalité, le plus petit identifiant) garde la
+        tâche, l'autre la laisse et replanifie. Filet de sécurité quand les plans divergent (connaissances
+        différentes, plans calculés à des instants différents)."""
+        m = self.mission
+        me = pose.pos
+        if m.kind in (MissionKind.GOTO_WOUNDED, MissionKind.DROP) and m.target is not None:
+            tgt = np.array(m.target)
+            mine = float(np.linalg.norm(tgt - me))
+            for a in self.world.others():
+                if t - a.t > 10 or a.mission.target is None \
+                        or a.mission.kind not in (MissionKind.GOTO_WOUNDED, MissionKind.DROP):
+                    continue
+                if np.linalg.norm(np.array(a.mission.target) - tgt) > 40.0:
+                    continue
+                theirs = float(np.linalg.norm(np.array(a.pos) - tgt))
+                if theirs < mine - 5.0 or (abs(theirs - mine) <= 5.0 and a.origin < self.me):
+                    self.planner.ban(tgt, t + 60)     # le plan ne me le redonnera pas tant que l'autre y va
+                    self._grasp = 0
+                    self.mission = Mission(MissionKind.IDLE)
+                    self._plan_reason = "conflict"
+                    return
+        elif m.kind == MissionKind.FOLLOW and m.peer >= 0:
+            lead = self.world.agents.get(m.peer)
+            if lead is None:
+                return
+            lp = np.array(lead.pos)
+            mine = float(np.linalg.norm(lp - me))
+            for a in self.world.others():
+                if t - a.t > 10 or a.mission.kind != MissionKind.FOLLOW or a.mission.peer != m.peer:
+                    continue
+                theirs = float(np.linalg.norm(np.array(a.pos) - lp))
+                if theirs < mine - 5.0 or (abs(theirs - mine) <= 5.0 and a.origin < self.me):
+                    self._no_follow[m.peer] = t + 60
+                    self.mission = Mission(MissionKind.IDLE)
+                    self._plan_reason = "conflict"
+                    return
+
+    def _refresh_explore(self, t, pose, f) -> None:
+        """Meneur : vise en continu le bord ouvert le plus proche de lui plutôt qu'un point fixe. Au fil de
+        l'avancée, la frontière recule et la cible avec elle : on suit l'ouvert. En profondeur : bonus pour finir la
+        pièce où l'on est et pour rester sur sa voie ; les bords visés par un autre meneur sont évités."""
+        self._last_explore = t
+        p, w = self.p, self.world
+        grid = PlanGrid(w, p, pose.pos, extra_cost=extra_cost_from_agents(w, t, w.map, (w.map.W, w.map.H), self.me))
+        grid.solve()
+        fr = grid.frontiers(p.frontier_min_cells)
+        if not fr:
+            self._plan_reason = "stuck"                       # plus rien d'ouvert d'ici : nouvelle allocation
+            return
+        topo = self.team._topo
+        my_reg = topo.region_at(pose.pos, search=3) if topo is not None else -1
+        others = [np.array(a.mission.target) for a in w.others() if t - a.t < 60
+                  and a.mission.kind == MissionKind.EXPLORE and a.mission.target is not None]
+        lane = np.array(self.mission.target) if self.mission.target is not None else None
+        best, bc = None, float("inf")
+        for fx in fr:
+            cxy = grid.m.cell_to_world(np.array([fx.cell[0]]), np.array([fx.cell[1]]))[0]
+            if self.planner._banned(cxy, t):
+                continue
+            c = fx.cost - p.frontier_size_gain * fx.size
+            if topo is not None and my_reg >= 0 and topo.region_of_cell(fx.cell) == my_reg:
+                c -= p.lane_region_bonus
+            if lane is not None and np.linalg.norm(cxy - lane) < p.lane_sticky_radius:
+                c -= p.lane_sticky_bonus
+            if any(np.linalg.norm(cxy - q) < p.frontier_spacing for q in others):
+                c += p.claim_penalty
+            if c < bc:
+                best, bc = cxy, c
+        if best is None:
+            return
+        # on quitte une pièce finie qui contient encore un blessé : on le dépose d'abord devant la porte
+        drop = self.team.drop_task(t, pose.pos, leaving_to=best)
+        if drop is not None and not self.planner._banned(np.array(drop.target), t):
+            self.mission = drop
+            self._plan_reason = "stuck"                       # route vers le blessé au pas suivant (cf. _replan)
+            return
+        r = grid.route_to(best, t, self._speed(f.carrying))
+        if r is None:
+            return
+        self.mission = replace(self.mission, target=(float(best[0]), float(best[1])))
+        self.route = r
+        self.follower.set_route(r)
+
     def _refresh_follow(self, t, pose, f) -> None:
         """Suiveur : la route vers le meneur est recalculée souvent, sans refaire l'allocation d'équipe."""
         self._last_follow = t
@@ -463,7 +596,7 @@ class Brain:
                 self.world.set_state(key, ObjState.RESCUED, t)        # disparu : sauvé
                 self._pending_drop = None
 
-        if self.mission.kind == MissionKind.GOTO_WOUNDED and not f.carrying and self.mission.target is not None:
+        if self.mission.kind in (MissionKind.GOTO_WOUNDED, MissionKind.DROP) and not f.carrying and self.mission.target is not None:
             tgt = np.array(self.mission.target)
             vis = [(pos, d) for pos, d, st in seen["wounded"] if st == ObjState.SEEN and np.linalg.norm(pos - tgt) < 60.0]
             if vis:
@@ -513,7 +646,13 @@ class Brain:
             if g is not None and np.linalg.norm(np.array(g.pos) - pose.pos) < 90.0:
                 hold = True
 
-        if f.carrying:
+        if f.carrying and self.mission.kind == MissionKind.DROP and self.mission.dest is not None:
+            # dépose devant la porte : on lâche au point prévu, la piste reste « à prendre » (cf. step)
+            self._grasp = 1
+            if np.linalg.norm(np.array(self.mission.dest) - pose.pos) < 25.0:
+                self._grasp = 0
+                self._drop_release = True
+        elif f.carrying:
             # Le blessé est sauvé quand IL TOUCHE le centre de secours : on garde la pince fermée et on fonce
             # dessus à vue. Le lidar voit le centre comme un mur : sans ça, marge et répulsion nous arrêtent avant.
             self._grasp = 1
@@ -588,7 +727,7 @@ class Brain:
                 if u is not None:
                     self.theta_ref = _wrap_angle(math.atan2(-u[1], -u[0]) - self._carry_bearing)
 
-        end_stop = self.mission.kind in (MissionKind.EXPLORE, MissionKind.CARRY, MissionKind.GOTO_WOUNDED,
+        end_stop = self.mission.kind in (MissionKind.EXPLORE, MissionKind.CARRY, MissionKind.GOTO_WOUNDED, MissionKind.DROP,
                                          MissionKind.RETURN, MissionKind.IDLE, MissionKind.RELAY, MissionKind.FOLLOW)
         cmd = self.follower.command(pose, v_est, lidar, f.angles, self.theta_ref, self._speed(f.carrying),
                                     grasp=self._grasp, hold=hold or self.route is None,

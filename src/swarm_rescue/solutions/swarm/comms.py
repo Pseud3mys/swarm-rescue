@@ -92,6 +92,19 @@ class Gossip:
         mine = np.asarray(mine, dtype=np.int64)
         ids = list(peers)
         K = np.array([peers[i] for i in ids], dtype=np.int64).reshape(len(ids), MAX_ORIGINS)
+        if not (K < mine).any():                               # personne en retard (cas courant) : tous à jour
+            for r, P in enumerate(ids):
+                prog = self._progress.get((stream, P))
+                if prog is None:
+                    self._progress[(stream, P)] = [K[r].copy(), np.full(MAX_ORIGINS, t)]
+                else:
+                    prog[0] = np.maximum(prog[0], K[r])
+                    prog[1][:] = t
+            return []
+        # clé d'élection (connaissance, puis plus petit identifiant) : un seul max par origine
+        ida = np.array(ids, dtype=np.int64)
+        key = K * 64 + (63 - ida)[:, None]
+        key_me = mine * 64 + (63 - me)
         lagging: dict[int, list] = {}
         for r, P in enumerate(ids):
             kP = K[r]
@@ -103,16 +116,10 @@ class Gossip:
             if not behind.any():
                 continue
             a = w.agents.get(P)
-            hp = set(a.heard) if a is not None and t - a.t <= 2 else set()
-            # meilleur relais possible vers P, par origine : (connaissance, -identifiant) maximal
-            best_k, best_id = mine.copy(), np.full(MAX_ORIGINS, me)
-            for c, X in enumerate(ids):
-                if X == P or X not in hp:
-                    continue
-                kX = K[c]
-                better = (kX > best_k) | ((kX == best_k) & (X < best_id))
-                best_k = np.where(better, kX, best_k)
-                best_id = np.where(better, X, best_id)
+            hp = a.heard if a is not None and t - a.t <= 2 else ()
+            cand = np.isin(ida, hp) & (ida != P)
+            best = np.maximum(key_me, key[cand].max(axis=0)) if cand.any() else key_me
+            best_id = np.where(best == key_me, me, -1)
             stalled = t - prog[1] > cfg.stall
             for o in np.nonzero(behind & ((best_id == me) | stalled))[0].tolist():
                 lagging.setdefault(o, []).append(int(kP[o]))

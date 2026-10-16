@@ -35,6 +35,7 @@ _ROLE = {
     MissionKind.RECEIVE: ("T", (0, 160, 60), "prend le relais"),
     MissionKind.RETURN: ("H", (120, 120, 120), "retour"),
     MissionKind.IDLE: ("I", (120, 120, 120), "sans tâche"),
+    MissionKind.DROP: ("D", (200, 120, 40), "dépose un blessé à la porte"),
 }
 _DEAD = (60, 60, 60)
 _W_COLOR = {ObjState.SEEN: (230, 30, 30), ObjState.CARRIED: (245, 140, 0)}

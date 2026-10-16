@@ -45,6 +45,7 @@ class MissionKind(IntEnum):
     RELAY = 5  # rester en position centrale pour servir de messager
     FOLLOW = 6  # suivre un meneur d'exploration à distance radio (binôme)
     RECEIVE = 7  # aller prendre le blessé d'un porteur (passage de relais), peer = porteur
+    DROP = 8     # explorateur : prendre le blessé de sa pièce (target) et le déposer à la porte (dest), puis reprendre
 
 
 class ObjKind(IntEnum):
@@ -79,6 +80,7 @@ class Mission:
     target: Optional[Vec] = None
     started: int = 0
     peer: int = -1      # FOLLOW : meneur suivi ; CARRY : receveur demandé (passage de relais) ; RECEIVE : porteur
+    dest: Optional[Vec] = None   # DROP : point de dépose (devant la porte de la pièce, hors de l'axe de passage)
 
 
 @dataclass(frozen=True)

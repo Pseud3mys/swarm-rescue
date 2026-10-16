@@ -64,20 +64,28 @@ class FusedObject:
         return math.sqrt(max(0.5 * (self.cov[0] + self.cov[2]), 0.0))
 
 
+def _inv2(a: float, b: float, c: float) -> tuple:
+    """Inverse d'une matrice symétrique 2x2 [[a, b], [b, c]] (forme fermée : appelée des milliers de fois)."""
+    det = max(a * c - b * b, 1e-12)
+    return c / det, -b / det, a / det
+
+
 def _same(kind, pa, ca, pb, cb) -> tuple[bool, float]:
     r_min, r_max = ASSOC[kind]
-    d = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+    dx, dy = pa[0] - pb[0], pa[1] - pb[1]
+    d = math.hypot(dx, dy)
     if d > r_max:
         return False, float("inf")
     if d <= r_min:
         return True, 0.0
-    m2 = fusion.mahalanobis2(pa, fusion.cov_unpack(ca), pb, fusion.cov_unpack(cb))
+    ia, ib, ic = _inv2(ca[0] + cb[0], ca[1] + cb[1], ca[2] + cb[2])
+    m2 = ia * dx * dx + 2.0 * ib * dx * dy + ic * dy * dy
     return m2 < GATE, m2
 
 
 def _fuse_group(tracks: list, exclude: int = -1):
     """Fusion des pistes d'un groupe : une estimation par origine (la plus précise, CARRIED exclues), sommées en
-    forme information. Renvoie ((pos, cov) ou None)."""
+    forme information (sources indépendantes). Renvoie ((pos, cov) ou None)."""
     per_origin = {}
     for x in tracks:
         if x.state == ObjState.CARRIED or x.origin == exclude:
@@ -90,8 +98,14 @@ def _fuse_group(tracks: list, exclude: int = -1):
     if len(per_origin) == 1:
         x = next(iter(per_origin.values()))
         return x.pos, x.cov
-    mu, P = fusion.fuse_independent((np.array(x.pos), fusion.cov_unpack(x.cov)) for x in per_origin.values())
-    return (float(mu[0]), float(mu[1])), fusion.cov_pack(P)
+    Ya = Yb = Yc = ya = yb = 0.0
+    for x in per_origin.values():
+        ia, ib, ic = _inv2(*x.cov)
+        Ya, Yb, Yc = Ya + ia, Yb + ib, Yc + ic
+        ya += ia * x.pos[0] + ib * x.pos[1]
+        yb += ib * x.pos[0] + ic * x.pos[1]
+    Pa, Pb, Pc = _inv2(Ya, Yb, Yc)
+    return (Pa * ya + Pb * yb, Pb * ya + Pc * yb), (Pa, Pb, Pc)
 
 
 def fuse_tracks(tracks, me: int = -1) -> list[FusedObject]:

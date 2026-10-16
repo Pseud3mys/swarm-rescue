@@ -99,7 +99,22 @@ class Params:
     explore_switch_penalty: float = 40.0  # un explorateur dont la région est encore ouverte ne part chercher un
                                           # blessé hors de sa région que si c'est nettement rentable
     region_sticky_gain: float = 0.5    # un meneur garde la région qu'il explore tant qu'elle est ouverte
-    relay_snap_cells: int = 4          # un relais peut être décalé de 4 cellules pour sortir des axes de passage
+    relay_snap_cells: int = 8          # un relais peut être décalé de 8 cellules (64 px) pour sortir des passages :
+                                       # la radio traverse les murs, il n'a pas besoin d'être sur le chemin
+    relay_spacing: float = 200.0       # px : écart entre maillons de la chaîne (avant décalage) ...
+    relay_link_max: float = 235.0      # ... et écart max après décalage (radio 250 px)
+    comp_fresh: int = 30               # pas : état d'un drone assez récent pour le compter dans MON réseau connexe
+    comp_link: float = 240.0           # px : lien prévu entre deux drones (positions annoncées extrapolées)
+    claim_radius: float = 200.0        # px : frontière déjà prise par un drone d'un AUTRE réseau (sa cible / position)
+    claim_penalty: float = 120.0       # surcoût de ces frontières (en coût de chemin)
+    lane_region_bonus: float = 60.0    # exploration en profondeur : on finit la pièce où l'on est avant d'en changer
+    lane_sticky_radius: float = 120.0  # px : on garde sa voie d'exploration si la frontière visée est encore là
+    lane_sticky_bonus: float = 40.0
+    explore_refresh: int = 10          # pas : un meneur recible la frontière ouverte la plus proche de lui
+    max_lanes: int = 6                 # voies d'exploration (meneurs) au plus
+    lane_share: float = 0.5            # part des drones libres d'un réseau qui mènent une voie d'exploration (le reste :
+                                       # relais nécessaires, suiveurs, blessés, base ; les drones en trop explorent aussi)
+    drop_offset: float = 40.0          # px : dépose du blessé derrière la porte, côté pièce parente
 
     # ---- missions ----------------------------------------------------------------------------------
     grasp_dist: float = 32.0
