@@ -56,7 +56,7 @@ class MissionPlanner:
         carriers = [a for a in others if a.mission.kind == MissionKind.CARRY]
         scored = []
         for o in w.objects_view(ObjKind.WOUNDED):
-            if o.state == ObjState.RESCUED:
+            if o.state in (ObjState.RESCUED, ObjState.TAKEN):
                 continue
             if o.state == ObjState.CARRIED and carriers:
                 continue

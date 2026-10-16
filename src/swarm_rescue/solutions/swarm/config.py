@@ -28,7 +28,7 @@ class Params:
     odom_sigma_dist: float = 0.2
     odom_sigma_alpha: float = math.radians(8.0)
     odom_sigma_theta: float = math.radians(1.0)
-    lidar_sigma: float = 2.0           # bruit gaussien supposé (non vu dans les fichiers fournis)
+    lidar_sigma: float = 2.5           # drone_lidar.py : N(0, 2.5) sur TOUS les rayons (y compris sans impact : 300 + bruit)
     lidar_max_range: float = 300.0
     semantic_max_range: float = 200.0
     comm_range: float = 250.0
@@ -92,6 +92,14 @@ class Params:
     follow_dist: float = 70.0          # px : le suiveur se tient à cette distance derrière le meneur
     pair_max: float = 160.0            # px : au-delà, le meneur attend son suiveur
     follow_replan: int = 12            # pas : rafraîchissement de la route du suiveur
+    topo_period: int = 40              # pas : la carte topologique est reconstruite à cette cadence (~8 ms)
+    topo_room_core: float = 48.0       # px : noyau de pièce = libre à plus de ça d'un mur connu (topo.py).
+                                       # Les cartes du dépôt ont des ouvertures de 70-170 px : 36 (prototype) fusionnait
+                                       # tout sur MapMedium02 ; 48 validé sur la vérité terrain (56 fusionne le hall)
+    explore_switch_penalty: float = 40.0  # un explorateur dont la région est encore ouverte ne part chercher un
+                                          # blessé hors de sa région que si c'est nettement rentable
+    region_sticky_gain: float = 0.5    # un meneur garde la région qu'il explore tant qu'elle est ouverte
+    relay_snap_cells: int = 4          # un relais peut être décalé de 4 cellules pour sortir des axes de passage
 
     # ---- missions ----------------------------------------------------------------------------------
     grasp_dist: float = 32.0

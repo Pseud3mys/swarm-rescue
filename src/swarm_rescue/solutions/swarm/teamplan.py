@@ -21,12 +21,14 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
+import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from .config import Params
 from .pathing import PlanGrid
 from .schema import AgentState, Mission, MissionKind, ObjKind, ObjState, Pose
+from .topo import TopoMap
 from .world import WorldModel
 
 BIG = 1e7
@@ -51,6 +53,7 @@ class TeamPlan:
     slots: list = field(default_factory=list)
     missions: dict = field(default_factory=dict)      # origin -> Mission
     roles: dict = field(default_factory=dict)         # origin -> kind de créneau ("" si sans tâche)
+    topo: Optional[TopoMap] = None                    # carte topologique utilisée (pour le debug)
 
 
 class TeamPlanner:
@@ -58,6 +61,8 @@ class TeamPlanner:
         self.w, self.p = world, params
         self.mp = planner                 # MissionPlanner : base, blessés libres, liste noire
         self.last: Optional[TeamPlan] = None
+        self._topo: Optional[TopoMap] = None
+        self._topo_t = -10 ** 9
 
     # ------------------------------------------------------------------ données d'entrée
     def _agents(self, t: int, pose: Pose, current: Mission) -> list[tuple[int, np.ndarray, Mission]]:
@@ -75,7 +80,7 @@ class TeamPlanner:
         carriers = [a for a in w.others() if t - a.t < 400 and a.mission.kind == MissionKind.CARRY]
         out = []
         for o in w.objects_view(ObjKind.WOUNDED):
-            if o.state == ObjState.RESCUED or (o.state == ObjState.CARRIED and carriers):
+            if o.state in (ObjState.RESCUED, ObjState.TAKEN) or (o.state == ObjState.CARRIED and carriers):
                 continue
             pos = np.array(o.pos)
             if self.mp._banned(pos, t) or not math.isfinite(grid.cost_to(pos)):
@@ -96,6 +101,14 @@ class TeamPlanner:
             root_cell = grid.start
         root_xy = m.cell_to_world(np.array([root_cell[0]]), np.array([root_cell[1]]))[0]
         dist_root, pred_root = grid.tree_from(root_cell)
+        frontiers = grid.frontiers(p.frontier_min_cells)
+        if self._topo is None or t - self._topo_t >= p.topo_period:     # la topologie évolue lentement
+            self._topo = TopoMap(grid, root_xy, r_room=p.topo_room_core, prev=self._topo)
+            self._topo_t = t
+            self._axis = self._topo.axis_mask()
+        topo = self._topo
+        topo.attach_frontiers(frontiers)
+        self._D = topo.D
 
         slots: list[Slot] = []
         for pos in self._wounded(t, grid)[:n]:
@@ -110,30 +123,38 @@ class TeamPlanner:
 
         # ---- frontières : dans l'ordre de distance à la base, tant qu'on peut les relier
         fr = []
-        for f in grid.frontiers(p.frontier_min_cells):
-            c = m.cell_to_world(np.array([f.cell[0]]), np.array([f.cell[1]]))[0]
-            d = float(dist_root[f.cell])
+        for f in frontiers:
+            # point représentatif = cellule de la frontière la plus proche de la BASE (et non du drone qui calcule) :
+            # le même pour tous les drones, sinon chacun place le créneau ailleurs et les allocations divergent
+            cell = f.cell
+            if f.cells is not None:
+                dr = dist_root[f.cells[0], f.cells[1]]
+                if np.isfinite(dr).any():
+                    j = int(np.argmin(dr))
+                    cell = (int(f.cells[0][j]), int(f.cells[1][j]))
+            c = m.cell_to_world(np.array([cell[0]]), np.array([cell[1]]))[0]
+            d = float(dist_root[cell])
             if math.isfinite(d) and not self.mp._banned(c, t):
-                fr.append((d - p.frontier_size_gain * f.size, f, c))
+                fr.append((d - p.frontier_size_gain * f.size, cell, c))
         fr.sort(key=lambda x: x[0])
         chosen, relays = [], []
-        for _, f, c in fr:
+        for _, fcell, c in fr:
             if remaining < 2 or len(chosen) >= p.team_max_frontiers:
                 break
             if any(np.linalg.norm(c - q) < p.frontier_spacing for q in chosen):
                 continue
-            new = self._relays_for(grid, pred_root, root_cell, root_xy, f.cell, relays)
+            new = self._relays_for(grid, pred_root, root_cell, root_xy, fcell, relays)
             if new is None or 2 + len(new) > remaining:
                 continue
             chosen.append(c)
             relays += new
             remaining -= 2 + len(new)
             i = len(slots)
-            slots.append(Slot("leader", c, f.cell, pair=i + 1))
-            slots.append(Slot("follower", c, f.cell, pair=i))
+            slots.append(Slot("leader", c, fcell, pair=i + 1))
+            slots.append(Slot("follower", c, fcell, pair=i))
         # ---- excursions : drones restants sur les frontières qu'on ne peut pas relier (binôme, ou seul s'il n'en
         # reste qu'un). Hors réseau un moment, ils rapportent la carte en revenant à portée (gossip).
-        for _, f, c in fr:
+        for _, fcell, c in fr:
             if remaining < 1 or len(chosen) >= p.team_max_frontiers + p.team_max_excursions:
                 break
             if any(np.linalg.norm(c - q) < p.frontier_spacing for q in chosen):
@@ -141,11 +162,11 @@ class TeamPlanner:
             chosen.append(c)
             i = len(slots)
             if remaining >= 2:
-                slots.append(Slot("leader", c, f.cell, pair=i + 1))
-                slots.append(Slot("follower", c, f.cell, pair=i))
+                slots.append(Slot("leader", c, fcell, pair=i + 1))
+                slots.append(Slot("follower", c, fcell, pair=i))
                 remaining -= 2
             else:
-                slots.append(Slot("leader", c, f.cell))
+                slots.append(Slot("leader", c, fcell))
                 remaining -= 1
         for r in relays:
             slots.append(Slot("relay", r, grid.cell(r)))
@@ -158,8 +179,8 @@ class TeamPlanner:
                 a = 2 * math.pi * k / 12
                 xy = root_xy + p.standby_ring * np.array((math.cos(a), math.sin(a)))
                 cell = grid.nearest_reachable(xy, radius=4)
-                if cell is not None and math.isfinite(dist_root[cell]):
-                    ring.append((float(dist_root[cell]), cell))
+                if cell is not None and math.isfinite(dist_root[cell]) and not self._axis[cell]:
+                    ring.append((float(dist_root[cell]), cell))     # jamais sur une porte ou un couloir
             ring.sort()
             picked = []
             for _, cell in ring:
@@ -170,7 +191,7 @@ class TeamPlanner:
                 if len(picked) >= n_ring:
                     break
 
-        plan = TeamPlan(t, root_xy, slots)
+        plan = TeamPlan(t, root_xy, slots, topo=topo)
         if not slots:
             self.last = plan
             return plan
@@ -188,19 +209,32 @@ class TeamPlanner:
         else:
             dmaps = dict(zip(cells, grid.dists_from(cells)))
             cost_of = lambda i, j: PlanGrid.lookup(dmaps[slots[j].cell], acells[i], radius=1)
+        slot_region = [topo.region_at(s.xy, search=3) for s in slots]
         C = np.full((n, len(slots)), BIG)
         for i, (origin, pos, mission) in enumerate(agents):
+            # région que l'agent explore (cible de sa mission), et sa région actuelle
+            my_reg = topo.region_at(pos, search=3)
+            exp_reg = -1
+            if mission.kind in (MissionKind.EXPLORE, MissionKind.FOLLOW) and mission.target is not None:
+                r = topo.region_at(mission.target, search=3)
+                if r in topo.regions and topo.regions[r].open:
+                    exp_reg = r
             for j, s in enumerate(slots):
                 c = cost_of(i, j)
                 if not math.isfinite(c):
                     continue
                 if s.kind == "wounded":
                     c -= p.wounded_bonus
+                    if exp_reg >= 0 and slot_region[j] not in (exp_reg, my_reg):
+                        c += p.explore_switch_penalty      # il a encore à explorer devant lui
                 elif s.kind == "follower":
                     c += 1.0                                   # à coût égal, le plus proche mène
                 if mission.kind == _SLOT_MISSION[s.kind] and mission.target is not None \
                         and np.linalg.norm(np.array(mission.target) - s.xy) < p.sticky_radius:
                     c = c * p.sticky_gain - p.sticky_bonus      # hystérésis : on garde sa tâche annoncée
+                elif s.kind in ("leader", "follower") and exp_reg >= 0 and slot_region[j] == exp_reg \
+                        and mission.kind == _SLOT_MISSION[s.kind]:
+                    c = c * p.region_sticky_gain - p.sticky_bonus   # même région pas finie : on la termine
                 C[i, j] = c
         rows, cols = linear_sum_assignment(C)
         by_slot = {}
@@ -226,20 +260,43 @@ class TeamPlanner:
         """Points de relais à ajouter le long du chemin base -> `cell` pour que deux maillons consécutifs
         restent à moins de link_range (distance euclidienne : la radio traverse les murs). Réutilise un relais
         déjà prévu s'il est proche du point voulu (tronc commun)."""
-        L = self.p.link_range
+        L, p = self.p.link_range, self.p
         path = grid.path_cells(cell, pred, root_cell)
         if path is None:
             return None
         a = np.array(path)
         pts = grid.m.cell_to_world(a[:, 0], a[:, 1])
-        new, last, prev = [], root_xy, root_xy
-        for q in pts:
+        goal = pts[-1]
+        on_path = np.zeros(self._axis.shape, np.uint8)
+        on_path[a[:, 0], a[:, 1]] = 1
+        on_path = cv2.dilate(on_path, np.ones((5, 5), np.uint8)) > 0     # la route des explorateurs (+/- 2 cellules)
+        new, last, prev, prev_c = [], root_xy, root_xy, a[0]
+        for q, qc in zip(pts, a):
+            # le binôme couvre lui-même le dernier tronçon (suiveur à follow_dist derrière le meneur)
+            if np.linalg.norm(goal - last) <= L + 0.7 * p.follow_dist:
+                break
             if np.linalg.norm(q - last) > L:
                 reuse = [r for r in list(existing) + new if np.linalg.norm(r - prev) < 0.4 * L]
                 if reuse:
                     last = min(reuse, key=lambda r: np.linalg.norm(r - prev))
                 else:
-                    new.append(prev.copy())
                     last = prev
-            prev = q
+                    new.append(self._snap_relay(grid, prev_c, on_path))
+            prev, prev_c = q, qc
         return new
+
+    def _snap_relay(self, grid: PlanGrid, cell, on_path) -> np.ndarray:
+        """Décale un poste de relais (au plus relay_snap_cells) hors des axes de passage et de la route des
+        explorateurs, vers l'endroit le plus dégagé : un relais immobile ne doit pas boucher un passage."""
+        r = self.p.relay_snap_cells
+        W, H = self._axis.shape
+        x0, x1 = max(cell[0] - r, 0), min(cell[0] + r + 1, W)
+        y0, y1 = max(cell[1] - r, 0), min(cell[1] + r + 1, H)
+        gx, gy = np.meshgrid(np.arange(x0, x1), np.arange(y0, y1), indexing="ij")
+        ok = (~self._axis[x0:x1, y0:y1]) & (~on_path[x0:x1, y0:y1]) & grid.trav[x0:x1, y0:y1] \
+            & np.isfinite(grid._dist[x0:x1, y0:y1]) & (np.hypot(gx - cell[0], gy - cell[1]) <= r)
+        if ok.any():
+            score = np.where(ok, self._D[x0:x1, y0:y1] - 0.3 * np.hypot(gx - cell[0], gy - cell[1]), -np.inf)
+            k = np.unravel_index(int(np.argmax(score)), score.shape)
+            cell = (int(gx[k]), int(gy[k]))
+        return grid.m.cell_to_world(np.array([cell[0]]), np.array([cell[1]]))[0]

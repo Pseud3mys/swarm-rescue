@@ -1,14 +1,21 @@
 """Amers géométriques (coins de mur) : extraction dans le scan lidar + association + recalage de l'EKF.
 
-Les coins sont stockés comme des objets du WorldModel (ObjKind.CORNER) : ils se partagent donc entre
-drones par le même gossip que le reste, et tous les drones se recalent sur les MÊMES points du monde.
+Les coins sont des objets du WorldModel (ObjKind.CORNER) partagés par le gossip. Chaque drone publie SA contribution
+pour un coin : son estimation fusionnée (Kalman sur toutes ses observations) avec sa covariance, dont le plancher est
+l'incertitude de sa pose (le biais GPS est commun à toutes ses observations). La lecture (world.fuse_tracks) associe
+les contributions des drones (porte de Mahalanobis) et les somme en forme information : l'estimation globale d'un
+coin est la même chez tous les drones et converge quand plusieurs drones l'ont vu.
 
-Précautions contre l'auto-confirmation :
-  - un amer ne sert au recalage qu'après `min_obs` observations espacées d'au moins `min_gap` pas
-    (le GPS est corrélé sur ~50 pas : deux observations rapprochées ne sont pas indépendantes) ;
-  - incertitude d'un amer = f(nombre d'observations) ; elle est ajoutée au bruit de mesure de l'EKF ;
-  - association par plus proche voisin avec test de rapport (ambiguïté -> on ignore) ;
-  - on ne crée d'amer que si la pose est suffisamment sûre.
+Règles :
+  - recalage de l'EKF sur l'estimation globale MOINS ma contribution (mes observations partagent l'erreur de ma
+    pose : me recaler dessus serait de l'auto-confirmation) ; sur la mienne seule uniquement sans GPS (elle date
+    d'un moment où ma pose était bonne) ;
+  - sans GPS (ou pose incertaine) : recalage dès qu'un coin connu est revu (délai `use_gap` par coin) ; avec GPS :
+    seulement sur des coins bien convergés vus par d'autres (délai plus long `use_gap_gps`) : information
+    indépendante, qui aide l'EKF à estimer le biais GPS ;
+  - contribution seulement avec une pose sûre (GPS + sigma < sigma_create), observations espacées de `min_gap` pas
+    (bruit GPS corrélé sur ~50 pas), et pas de nouvelle contribution sur un coin déjà convergé (volume radio borné) ;
+  - association par Mahalanobis avec test de rapport (ambiguïté -> on ignore).
 """
 from __future__ import annotations
 
@@ -19,12 +26,13 @@ import numpy as np
 
 from .config import Params
 from .estimator import PoseEKF
+from . import fusion
 from .schema import ObjKind
 from .world import WorldModel
 
 
 def extract_corners(ranges: np.ndarray, angles: np.ndarray, max_range: float,
-                    k: int = 6, rms_max: float = 2.6, min_arc: float = 14.0,
+                    k: int = 6, rms_max: float = 3.3, min_arc: float = 14.0,
                     r_min: float = 30.0, r_max: float = 120.0) -> np.ndarray:
     """Coins du scan, dans le repère du drone. Renvoie un tableau (M, 2).
 
@@ -104,76 +112,93 @@ def _corners_in_segment(x, y, k, rms_max, min_arc, r_min, r_max):
 
 class LandmarkTracker:
     def __init__(self, world: WorldModel, ekf: PoseEKF, params: Params,
-                 min_obs: int = 2, min_gap: int = 25, max_obs: int = 14,
-                 use_gap: int = 12, sigma_use: float = 6.0, sigma_create: float = 4.5):
-        """Recalage seulement si la pose est mauvaise (GPS coupé ou incertitude > sigma_use) : avec un bon GPS, les amers
-        (dont l'erreur est commune à toutes leurs observations) rendraient le filtre trop confiant. Un amer n'est
-        réutilisé qu'après `use_gap` pas. On ne crée / affine des amers que lorsque la pose est sûre (sigma_create)."""
+                 min_gap: int = 25, use_gap: int = 12, use_gap_gps: int = 40,
+                 sigma_use: float = 6.0, sigma_create: float = 4.5, converged_sigma: float = 2.0,
+                 gps_use_sigma: float = 3.0, **_):
         self.w, self.ekf, self.p = world, ekf, params
-        self.min_obs, self.min_gap, self.max_obs = min_obs, min_gap, max_obs
-        self.use_gap, self.sigma_use, self.sigma_create = use_gap, sigma_use, sigma_create
+        self.min_gap, self.use_gap, self.use_gap_gps = min_gap, use_gap, use_gap_gps
+        self.sigma_use, self.sigma_create = sigma_use, sigma_create
+        self.converged_sigma, self.gps_use_sigma = converged_sigma, gps_use_sigma
         self._last_use: dict = {}
-        self._ver = -1
-        self._pos = np.zeros((0, 2))
-        self._rev = np.zeros(0, int)
-        self._tseen = np.zeros(0, int)
+        self._last_obs: dict = {}
+        self._view, self._view_t = None, -10 ** 9
+        self._cand: list = []          # coins vus une fois : publiés seulement s'ils sont revus (pas de bruit sur la radio)
         self.n_used = 0
         self.n_created = 0
+        self.n_contrib = 0
 
-    def _db(self):
-        if self._ver != self.w.version:
-            tr = [o for o in self.w.objects.values() if o.kind == ObjKind.CORNER]
-            self._pos = np.array([o.pos for o in tr]).reshape(-1, 2)
-            self._rev = np.array([o.rev for o in tr], int)
-            self._tseen = np.array([o.t_seen for o in tr], int)
-            self._ver = self.w.version
-        return self._pos, self._rev, self._tseen
-
-    @staticmethod
-    def sigma_l(rev: int) -> float:
-        return 2.5 + 6.0 / math.sqrt(max(rev, 1))
+    def _candidate(self, t: int, wpos, Rm, floor: float) -> None:
+        """Un coin inconnu n'est publié qu'à sa 2e observation, au moins 6 pas plus tard (autre point de vue) : les
+        détections isolées (bruit, objets) restent locales et sont oubliées au bout de 150 pas."""
+        self._cand = [c for c in self._cand if t - c[2] < 150]
+        for i, c in enumerate(self._cand):
+            if np.linalg.norm(c[0] - wpos) < 8.0:
+                if t - c[2] >= 6:
+                    self.w.observe_object(ObjKind.CORNER, c[0], c[2], cov=c[1], floor_var=floor)
+                    self.w.observe_object(ObjKind.CORNER, wpos, t, cov=Rm, floor_var=floor)
+                    del self._cand[i]
+                    self.n_created += 1
+                return
+        self._cand.append((wpos, Rm, t))
 
     def process(self, t: int, ranges, angles) -> int:
         """Renvoie le nombre de recalages appliqués à l'EKF."""
         p = self.p
         corners = extract_corners(ranges, angles, p.lidar_max_range)
+        if len(corners) == 0:
+            return 0
+        if self._view is None or t - self._view_t >= 8:   # vue fusionnée des coins : reconstruite au plus tous les 8 pas
+            view = self.w.objects_view(ObjKind.CORNER)
+            self._view, self._view_t = (view, np.array([o.pos for o in view], float).reshape(-1, 2)), t
+        view, P = self._view
         used = 0
         for c in corners:
             pose = self.ekf.pose()
+            rng, brg = math.hypot(c[0], c[1]), math.atan2(c[1], c[0])
             ct, st = math.cos(pose.theta), math.sin(pose.theta)
             wpos = np.array((pose.x + ct * c[0] - st * c[1], pose.y + st * c[0] + ct * c[1]))
-            pos, rev, tseen = self._db()
-            gate = min(25.0, 3.0 * math.sqrt(pose.sigma ** 2 + 4.0) + 4.0)
-            if len(pos):
-                d = np.linalg.norm(pos - wpos, axis=1)
-                near = np.nonzero(d < gate)[0]
-            else:
-                near = np.zeros(0, int)
-            if near.size == 0:
-                if pose.sigma < self.sigma_create:
-                    self.w.observe_object(ObjKind.CORNER, wpos, t)
-                    self.n_created += 1
+            Rm = fusion.meas_point_cov(pose.cov, pose.theta, rng, brg, p.landmark_sigma_r, p.landmark_sigma_b)
+            floor = 0.5 * float(pose.cov[0, 0] + pose.cov[1, 1])
+            pose_ok = self.ekf.gps_ok and pose.sigma < self.sigma_create
+            # ---- association (Mahalanobis, test de rapport)
+            near = np.nonzero(np.linalg.norm(P - wpos, axis=1) < 15.0)[0] if len(P) else np.zeros(0, int)
+            scored = []
+            for i in near.tolist():
+                m2 = fusion.mahalanobis2(view[i].pos, fusion.cov_unpack(view[i].cov), wpos, Rm)
+                if m2 < p.gate_chi2:
+                    scored.append((m2, i))
+            if not scored:
+                if pose_ok:
+                    self._candidate(t, wpos, Rm, floor)
                 continue
-            near = near[np.argsort(d[near])]
-            i0 = near[0]
-            same = near[np.linalg.norm(pos[near] - pos[i0], axis=1) < 14.0]
-            others = np.setdiff1d(near, same)
-            if others.size and d[others].min() < max(1.7 * d[i0], d[i0] + 6.0):
+            scored.sort()
+            if len(scored) > 1 and scored[1][0] < max(4.0 * scored[0][0], scored[0][0] + 4.0):
                 continue                                    # ambigu : on s'abstient
-            best = same[np.argmax(rev[same])]
-            lm = pos[best]
-            rng, brg = math.hypot(c[0], c[1]), math.atan2(c[1], c[0])
-            key = int(best)
+            lm = view[scored[0][1]]
+            key = lm.sources[0]                             # identifiant stable du coin (plus petite clé du groupe)
+            # ---- recalage
+            if lm.others_pos is not None:
+                est = (lm.others_pos, lm.others_cov)
+            elif lm.mine is not None and not self.ekf.gps_ok:
+                est = (lm.pos, lm.cov)
+            else:
+                est = None
             need_fix = (not self.ekf.gps_ok) or pose.sigma > self.sigma_use
-            if (need_fix and rev[best] >= self.min_obs and t - self._last_use.get(key, -10 ** 9) >= self.use_gap
-                    and self.ekf.update_landmark(lm, rng, brg, self.sigma_l(int(rev[best])))):
-                self._last_use[key] = t
-                used += 1
+            if est is not None:
+                s_est = math.sqrt(0.5 * (est[1][0] + est[1][2]))
+                gap = self.use_gap if need_fix else self.use_gap_gps
+                allowed = need_fix or (lm.others_pos is not None and s_est < self.gps_use_sigma)
+                if allowed and t - self._last_use.get(key, -10 ** 9) >= gap                         and self.ekf.update_landmark(est[0], rng, brg, cov_l=fusion.cov_unpack(est[1])):
+                    self._last_use[key] = t
+                    used += 1
+            # ---- contribution (pose sûre, observations espacées, coin pas encore convergé)
+            if pose_ok and t - self._last_obs.get(key, -10 ** 9) >= self.min_gap                     and (lm.mine is not None or lm.sigma > self.converged_sigma):
                 pose = self.ekf.pose()
                 ct, st = math.cos(pose.theta), math.sin(pose.theta)
                 wpos = np.array((pose.x + ct * c[0] - st * c[1], pose.y + st * c[0] + ct * c[1]))
-            # affinage de l'amer (borné pour ne pas inonder la radio)
-            if rev[best] < self.max_obs and t - tseen[best] >= self.min_gap and pose.sigma < self.sigma_create and self.ekf.gps_ok:
-                self.w.observe_object(ObjKind.CORNER, wpos, t)
+                Rm = fusion.meas_point_cov(pose.cov, pose.theta, rng, brg, p.landmark_sigma_r, p.landmark_sigma_b)
+                self.w.observe_object(ObjKind.CORNER, wpos, t, cov=Rm, floor_var=floor)
+                self._last_obs[key] = t
+                self.n_contrib += 1
         self.n_used += used
         return used

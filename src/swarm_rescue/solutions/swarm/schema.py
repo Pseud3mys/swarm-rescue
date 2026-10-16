@@ -9,6 +9,18 @@ Règles de conception (à ne pas casser) :
   3. Tout est immuable (frozen) et les tableaux numpy sont copiés à l'émission,
      pour que deux drones ne partagent jamais la même mémoire dans le simulateur.
   4. Le temps est le pas de simulation (commun à tous les drones, pas d'horloge à synchroniser).
+
+Ce qui circule = la CONTRIBUTION de chaque drone, déjà fusionnée par lui : pour un amer ou un blessé, sa meilleure
+estimation (moyenne + covariance) qui résume TOUTES ses observations ; pour la carte, sa couche de log-odds. Le
+receveur combine les contributions des différents drones par somme d'informations (sources indépendantes : biais de
+pose différents) : tous les drones obtiennent la MÊME estimation globale, et l'incertitude décroît vraiment avec le
+nombre de drones. On ne réémet jamais l'estimation globale elle-même : en revenant par un autre chemin radio, elle
+serait comptée deux fois (le filtre deviendrait sûr de lui sans information nouvelle).
+
+Révisions = tampons d'un compteur PAR PROPRIÉTAIRE (un pour la carte, un pour les objets), uniques et croissants.
+Résumé = vecteur de versions : `known[o]` = "j'ai la dernière version de chaque donnée de `o` dont le tampon est
+<= known[o]". L'émetteur envoie les données de `o` par tampons croissants et déclare la plage couverte (lo, hi] ;
+le receveur n'avance `known[o]` que si la plage prolonge ce qu'il a déjà (lo <= known[o]) : rien ne se perd.
 """
 from __future__ import annotations
 
@@ -50,6 +62,8 @@ class ObjState(IntEnum):
     SEEN = 0
     CARRIED = 1
     RESCUED = 2
+    TAKEN = 3      # ramassé ICI (n'y est plus) : pierre tombale à l'endroit de la saisie, remplacée par une
+                   # observation plus récente si le blessé y est reposé
 
 
 @dataclass(frozen=True)
@@ -79,15 +93,17 @@ class AgentState:
     mission: Mission
     route: tuple[Waypoint, ...] = ()
     heard: tuple[int, ...] = ()     # voisins dont j'ai reçu un paquet à ce pas (liens radio réels)
+    pos_sigma: float = 0.0          # incertitude de position (px, écart-type) de l'estimateur du drone
 
 
 @dataclass(frozen=True)
 class ObjectTrack:
-    """Observation d'un objet par son propriétaire. La déduplication entre drones
-    (même blessé vu par deux drones) est faite à la lecture, pas à l'écriture."""
+    """Contribution d'un drone sur un objet : SON estimation fusionnée (toutes ses observations) avec covariance.
+    L'association entre drones (même blessé vu par deux drones) et la fusion globale sont faites à la lecture
+    (world.fuse_tracks : porte de Mahalanobis, ordre déterministe)."""
     origin: int
     local_id: int
-    rev: int
+    rev: int                           # tampon du compteur d'objets du propriétaire (unique, croissant)
     kind: ObjKind
     pos: Vec
     t_seen: int
@@ -105,18 +121,19 @@ class MapPatch:
     origin: int
     cx: int
     cy: int
-    rev: int
-    data: np.ndarray  # int8 (chunk, chunk), log-odds de l'origine
+    rev: int                          # tampon du compteur de carte du propriétaire (unique, croissant)
+    data: Optional[np.ndarray]        # int8 (chunk, chunk), log-odds de l'origine ; None si tuile uniforme ...
+    fill: int = 0                     # ... de valeur `fill` (tuile saturée libre, vide : fréquent, 1 octet)
 
 
 @dataclass(frozen=True)
 class Digest:
-    """Résumé de ce que je sais : permet au voisin de m'envoyer seulement ce qui me manque."""
+    """Résumé de ce que je sais (vecteurs de versions, taille fixe) : le voisin m'envoie seulement ce qui me manque."""
     sender: int
     t: int
-    map_rev: np.ndarray                 # (MAX_ORIGINS, ncx, ncy) uint32
+    map_known: tuple                    # (MAX_ORIGINS,) : tuiles de l'origine o à jour jusqu'au tampon map_known[o]
+    obj_known: tuple                    # (MAX_ORIGINS,) : idem pour les objets
     agent_seq: dict[int, int]
-    obj_rev: dict[tuple[int, int], int]
 
 
 @dataclass(frozen=True)
@@ -128,12 +145,14 @@ class Packet:
     agents: tuple[AgentState, ...] = ()
     objects: tuple[ObjectTrack, ...] = ()
     patches: tuple[MapPatch, ...] = ()
+    obj_ranges: tuple = ()              # ((origin, lo, hi), ...) : TOUS les objets de origin de tampon dans (lo, hi]
+    map_ranges: tuple = ()              # idem pour les tuiles
 
     def approx_bytes(self) -> int:
-        n = self.digest.map_rev.nbytes + 16 * (len(self.digest.agent_seq) + len(self.digest.obj_rev))
-        n += sum(64 + 24 * len(a.route) for a in self.agents)
-        n += 48 * len(self.objects)
-        n += sum(24 + p.data.nbytes for p in self.patches)
+        n = 8 * 2 * MAX_ORIGINS + 8 * len(self.digest.agent_seq) + 12 * (len(self.obj_ranges) + len(self.map_ranges))
+        n += sum(72 + 24 * len(a.route) for a in self.agents)
+        n += 64 * len(self.objects)
+        n += sum(16 + (p.data.nbytes if p.data is not None else 1) for p in self.patches)
         return n
 
 

@@ -22,7 +22,8 @@ import numpy as np
 
 from .swarm.gridmap import FREE_THR, OCC_THR, VIEW_CLIP
 from .swarm.schema import MissionKind, ObjKind, ObjState
-from .swarm.world import WorldModel
+from .swarm.topo import CORRIDOR
+from .swarm.world import fuse_tracks
 
 # mission -> (lettre, couleur, libellé)
 _ROLE = {
@@ -49,6 +50,17 @@ def _lut() -> np.ndarray:
     return np.stack([g, g, g], axis=1)
 
 
+def _topo_lut() -> np.ndarray:
+    """0 transparent, 1..20 pièces (pastels), 21 porte (jaune), 22 couloir (orange)."""
+    lut = np.zeros((256, 4), np.uint8)
+    rng = np.random.RandomState(7)
+    lut[1:21, :3] = rng.randint(90, 230, (20, 3))
+    lut[1:21, 3] = 70
+    lut[21] = (255, 215, 0, 150)
+    lut[22] = (255, 120, 0, 120)
+    return lut
+
+
 def _index(view: np.ndarray) -> np.ndarray:
     return (np.clip(view, -VIEW_CLIP, VIEW_CLIP) + VIEW_CLIP).astype(np.uint8)
 
@@ -66,6 +78,17 @@ class _Panel:
         self.img.setLevels((0, 2 * VIEW_CLIP))
         self.img.setRect(rect)                    # repère monde (px), origine au centre de la carte
         plot.addItem(self.img)
+        self.topo = None
+        self.tree = None
+        if big:                                   # surcouche topologique (pièces / portes / couloirs + arbre)
+            self.topo = pg.ImageItem(np.zeros(shape, np.uint8), axisOrder="col-major")
+            self.topo.setLookupTable(_topo_lut())
+            self.topo.setLevels((0, 255))
+            self.topo.setRect(rect)
+            plot.addItem(self.topo)
+            self.tree = plot.plot([], [], pen=pg.mkPen((0, 60, 220, 170), width=2), connect="pairs")
+            self.doors = pg.ScatterPlotItem(size=9, pen=None, brush=pg.mkBrush(230, 50, 50))
+            plot.addItem(self.doors)
         plot.setRange(rect, padding=0.0)          # cadrage fixe : le recadrage auto à chaque mise à jour coûte cher
         plot.disableAutoRange()
         w = 2 if big else 1
@@ -99,6 +122,7 @@ class SwarmDebugView:
         self._job = 0
         self._pens = {}
         self._brushes = {}
+        self._topo_t = None
 
     # ------------------------------------------------------------------ cache Qt
     def _pen(self, color, width=3):
@@ -156,7 +180,9 @@ class SwarmDebugView:
                            (_ROLE[k] for k in (MissionKind.EXPLORE, MissionKind.FOLLOW, MissionKind.RELAY,
                                                MissionKind.GOTO_WOUNDED, MissionKind.CARRY, MissionKind.RECEIVE)))
         legend += ("  &nbsp;|&nbsp; <b>O</b> vrai blessé &nbsp; <span style='color:rgb(230,30,30)'>&#9679;</span> blessé cru"
-                   " &nbsp; &#9671; poste relais/base &nbsp; trait rouge = erreur de pose &nbsp; vert = lien radio")
+                   " &nbsp; &#9671; poste relais/base &nbsp; trait rouge = erreur de pose &nbsp; vert = lien radio"
+                   " &nbsp;|&nbsp; <span style='color:rgb(230,50,50)'>&#9679;</span> passage/porte"
+                   " <span style='background:rgb(255,160,60)'>couloir</span> pièces en pastel, arbre en bleu")
         lab = QLabel(legend)
         grid.addWidget(lab, 1, 0, 1, ncol)
         self._panels = []
@@ -255,6 +281,20 @@ class SwarmDebugView:
         seg = np.array(seg).reshape(-1, 2)
         big.links.setData(seg[:, 0], seg[:, 1]) if len(seg) else big.links.setData([], [])
         plan = alive[0]._brain.team.last if alive else None
+        if plan is not None and plan.topo is not None and plan.t != self._topo_t:
+            self._topo_t = plan.t                 # la topologie ne change qu'aux replanifications
+            tp = plan.topo
+            idx = np.zeros(tp.labels.shape, np.uint8)
+            seg = []
+            for r in tp.regions.values():
+                idx[tp.labels == r.rid] = 22 if r.kind == CORRIDOR else 1 + r.rid % 20
+                if r.parent >= 0:
+                    lp = tp.links[r.link].pos
+                    seg += [r.center, lp, lp, tp.regions[r.parent].center]
+            big.topo.setImage(idx, autoLevels=False)
+            big.doors.setData(pos=[l.pos for l in tp.links])           # passages (portes) = arêtes du graphe
+            seg = np.array(seg).reshape(-1, 2)
+            big.tree.setData(seg[:, 0], seg[:, 1]) if len(seg) else big.tree.setData([], [])
         big.slots.setData([{"pos": s.xy, "symbol": "d" if s.kind == "relay" else "star"}
                            for s in (plan.slots if plan else []) if s.kind in ("relay", "base")])
 
@@ -273,10 +313,8 @@ class SwarmDebugView:
             for k, o in d._brain.world.objects.items():
                 if o.kind == ObjKind.WOUNDED and (k not in merged or o.rev > merged[k].rev):
                     merged[k] = o
-        tmp = WorldModel.__new__(WorldModel)
-        tmp.objects = merged
         spots = []
-        for o in tmp._objects_view(ObjKind.WOUNDED):
+        for o in fuse_tracks(list(merged.values())):
             if o.state in _W_COLOR:
                 spots.append({"pos": o.pos, "brush": self._brush(_W_COLOR[o.state]), "symbol": "o"})
         return spots

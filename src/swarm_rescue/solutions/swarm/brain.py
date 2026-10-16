@@ -23,7 +23,7 @@ from .gridmap import OCC_THR
 from .landmarks import LandmarkTracker
 from .missions import MissionPlanner
 from .pathing import PlanGrid, extra_cost_from_agents
-from .perception import ScanIntegrator, drone_ray_mask, observe_semantic
+from .perception import ScanIntegrator, dynamic_ray_mask, observe_semantic
 from .schema import Command, Mission, MissionKind, ObjKind, ObjState, Packet, Route, SensorFrame
 from .teamplan import TeamPlanner
 from .world import WorldModel
@@ -78,6 +78,7 @@ class Brain:
         self._rc_close_since = None
         self._no_wait_until = -1
         self._last_follow = -10 ** 9
+        self._cleared: set = set()      # blessés dont les impacts lidar ont été effacés de ma couche
         self.timing = {"est": 0.0, "map": 0.0, "plan": 0.0, "ctl": 0.0, "n_plan": 0}
 
     # ------------------------------------------------------------------ interface
@@ -98,8 +99,8 @@ class Brain:
         self.ekf.update_compass(f.compass)
         if not self.ekf.initialized:
             return Command()
-        # amers : utiles surtout sans GPS ; avec GPS on les entretient à faible cadence (calcul)
-        if f.lidar is not None and t % (2 if f.gps is None else 6) == 0:
+        # amers : recalage dès qu'un coin connu est revu sans GPS ; avec GPS, entretien + recalage sur les coins convergés
+        if f.lidar is not None and t % (2 if f.gps is None else 4) == 0:
             self.landmarks.process(t, f.lidar, f.angles)
         pose = self.ekf.pose()
         if self.theta_ref is None:
@@ -111,8 +112,11 @@ class Brain:
             w.observe_object(ObjKind.RETURN_AREA, pose.pos, t)
             self._home_set = True
         if f.lidar is not None and t % 2 == 0:       # un scan sur deux suffit (on bouge de < 5 px par pas)
-            self.scan.integrate(pose, f.lidar, f.angles, drone_ray_mask(f.lidar, f.angles, f.semantic))
+            mask = dynamic_ray_mask(f.lidar, f.angles, f.semantic, pose, self._bodies(t))
+            self.scan.integrate(pose, f.lidar, f.angles, mask)
         seen = observe_semantic(w, pose, f.semantic, t, p)
+        if t % 20 == 0:
+            self._clear_phantoms()
         t2 = T()
 
         # ---- mission / chemin
@@ -122,6 +126,7 @@ class Brain:
                 tr = w.nearest_own(ObjKind.WOUNDED, pose.pos, 80.0)
                 if tr is None:
                     tr = w.observe_object(ObjKind.WOUNDED, pose.pos, t, ObjState.SEEN)
+                w.add_track(ObjKind.WOUNDED, tr.pos, t, ObjState.TAKEN, tr.cov)   # "pris ici" : efface sa position
                 self._carry_key = tr.key
                 self._carry_since = t
                 self._carry_bearing = self._wounded_bearing if self._wounded_bearing is not None else math.pi
@@ -153,11 +158,48 @@ class Brain:
 
         # ---- publication
         w.publish_self(t, pose.pos, pose.vel, f.health, self.mission,
-                       self.route.waypoints() if self.route is not None else (), self.gossip.heard)
+                       self.route.waypoints() if self.route is not None else (), self.gossip.heard, pose.sigma)
         self._packet = self.gossip.build_packet(t)
         for k, a, b in (("est", t0, t1), ("map", t1, t2), ("plan", t2, t3), ("ctl", t3, t4)):
             self.timing[k] += b - a
         return cmd
+
+    # ------------------------------------------------------------------ carte : objets mobiles
+    def _bodies(self, t) -> list:
+        """Corps mobiles connus à ne pas graver comme murs : autres drones (position annoncée extrapolée, porteurs avec
+        leur blessé) et blessés connus. Couvre le lidar au-delà des 200 px du capteur sémantique."""
+        out = []
+        for a in self.world.others():
+            age = t - a.t
+            if age > 5 or a.health <= 0:
+                continue
+            xy = (a.pos[0] + a.vel[0] * age, a.pos[1] + a.vel[1] * age)
+            rad = 20.0 + 2.0 * a.pos_sigma + 1.5 * age
+            if a.mission.kind == MissionKind.CARRY:
+                rad += 25.0                                     # le blessé pend derrière le porteur
+            out.append((xy, rad))
+        for o in self.world.objects_view(ObjKind.WOUNDED):
+            if o.state == ObjState.SEEN:
+                out.append((o.pos, 14.0 + 2.0 * o.sigma))
+        return out
+
+    def _clear_phantoms(self) -> None:
+        """Les blessés vus par le lidar avant d'être reconnus (portée 300 px contre 200) ont laissé des impacts dans MA
+        couche : on les efface une fois par blessé connu (je ne touche qu'à ma couche, propriétaire unique)."""
+        m = self.world.map
+        for o in self.world.objects_view(ObjKind.WOUNDED):
+            if o.state == ObjState.CARRIED:
+                continue
+            k = (int(o.pos[0] // 16), int(o.pos[1] // 16))
+            if k in self._cleared:
+                continue
+            self._cleared.add(k)
+            r = 13.0 + 1.5 * o.sigma                            # pas plus : un mur peut toucher le blessé
+            g = np.arange(-r, r + 1e-6, m.res / 2)
+            gx, gy = np.meshgrid(g, g, indexing="ij")
+            inside = gx ** 2 + gy ** 2 <= r * r
+            ix, iy = m.world_to_cell(np.stack((o.pos[0] + gx[inside], o.pos[1] + gy[inside]), axis=1))
+            m.clamp_max(self.me, ix, iy, 0)
 
     # ------------------------------------------------------------------ événements de replanification
     def _replan_reason(self, t, pose, f, seen) -> Optional[str]:

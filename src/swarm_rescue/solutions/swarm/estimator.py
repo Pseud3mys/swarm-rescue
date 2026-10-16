@@ -184,9 +184,11 @@ class PoseEKF:
         return True
 
     def update_landmark(self, landmark, rng: float, bearing: float, sigma_l: float = 0.0,
-                        sigma_r: Optional[float] = None, sigma_b: Optional[float] = None) -> bool:
+                        sigma_r: Optional[float] = None, sigma_b: Optional[float] = None,
+                        cov_l: Optional[np.ndarray] = None) -> bool:
         """Mesure d'un point connu du monde `landmark` vu à distance `rng` et relèvement `bearing`
-        (dans le repère du drone). `sigma_l` = incertitude sur la position de l'amer (px)."""
+        (dans le repère du drone). Incertitude de l'amer : `cov_l` (2x2, monde : estimation fusionnée de l'essaim),
+        sinon `sigma_l` (px, isotrope). Elle s'ajoute au bruit de mesure (propagée par le jacobien h / amer)."""
         if not self.initialized:
             return False
         p = self.p
@@ -199,7 +201,11 @@ class PoseEKF:
         H[1, 0], H[1, 1], H[1, 2] = dy / rho ** 2, -dx / rho ** 2, -1.0
         sr = (sigma_r if sigma_r is not None else p.landmark_sigma_r)
         sb = (sigma_b if sigma_b is not None else p.landmark_sigma_b)
-        R = np.diag([sr ** 2 + sigma_l ** 2, sb ** 2 + (sigma_l / rho) ** 2])
+        if cov_l is not None:
+            J = -H[:, 0:2]                                   # dh / d(amer) = - dh / d(position du drone)
+            R = np.diag([sr ** 2, sb ** 2]) + J @ np.asarray(cov_l, float) @ J.T
+        else:
+            R = np.diag([sr ** 2 + sigma_l ** 2, sb ** 2 + (sigma_l / rho) ** 2])
         h = [rho, math.atan2(dy, dx) - self.x[2]]
         m2, y, S, Sinv = self._update([rng, bearing], h, H, R, angle_rows=(1,))
         if m2 > p.gate_chi2:

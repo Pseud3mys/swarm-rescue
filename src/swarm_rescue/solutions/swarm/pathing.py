@@ -34,6 +34,7 @@ class Frontier:
     cost: float
     size: int
     pos: np.ndarray
+    cells: Optional[tuple] = None      # (ix, iy) de toutes les cellules de la frontière
 
 
 class PlanGrid:
@@ -235,7 +236,7 @@ class PlanGrid:
             j = int(np.argmin(d))
             cell = (int(ix[s + j]), int(iy[s + j]))
             pos = self.m.cell_to_world(np.array([ix[s:e].mean()]), np.array([iy[s:e].mean()]))[0]
-            out.append(Frontier(cell, float(d[j]), int(e - s), pos))
+            out.append(Frontier(cell, float(d[j]), int(e - s), pos, (ix[s:e].copy(), iy[s:e].copy())))
         return out
 
     def explored_fraction(self) -> float:
