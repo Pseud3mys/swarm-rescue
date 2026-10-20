@@ -78,6 +78,19 @@ de l'exploration et les anomalies détectées (`rescuer-on-stale-info`,
   Non fait : la porte d'association ENTRE drones (`fuse_tracks`) ne vieillit pas les pistes (pas d'instant courant).
 - Un drone mort ou muet reste compté dans l'équipe 100 pas (allocation), 400 (porteur), 600 (surcoût de route).
 
+## Carte : murs effacés / épaissis (perception.py, scanmatch.py)
+Mesuré en rejouant les scans enregistrés avec la VRAIE pose : presque aucun mur effacé ; avec la pose estimée,
+3-20 % des cœurs de mur selon le drone. Cause principale : le CAP (biais boussole AR(1) ~4°, odomètre 1°/pas ; un
+drone garé voyait son cap osciller de ±7° et balayait les murs lointains).
+- `scanmatch.py` : recalage scan -> carte (champ d'occupation lissé, Gauss-Newton). Pose complète sur les murs des
+  AUTRES drones (indépendant) ; cap seul sur ma carte (plancher 1,5° si la boussole marche, sinon 0,7°).
+- Lidar : un rayon sans impact n'écrit pas de libre dans les 2 cellules avant la portée max (un mur vers 290-300 px
+  alternait mur / libre) ; libre arrêté à 1 cellule / sin(incidence) avant l'impact (rayons rasants) ; cellule
+  CERTAINE de ma couche (|log-odds| >= 12) contredite seulement par des rayons fiables (impact continu, incidence
+  franche, < 200 px) ; impacts > 250 px : poids 1.
+- Carte 1 (1 drone), cœurs effacés / faux murs : avec GPS 29 / 95 -> 11 / 39 ; sans GPS 9 / 52 -> 1 / 18.
+- Coût : le recalage tourne un pas sur deux (à surveiller sur les grandes cartes : limite de temps réel).
+
 ## Partage de perceptions fusionnées
 Principe : chaque drone publie SA contribution déjà fusionnée (toutes ses observations, avec covariance), le receveur
 combine les contributions des différents drones par somme d'informations. On ne réémet jamais l'estimation globale :

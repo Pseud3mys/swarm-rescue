@@ -45,11 +45,12 @@ class SwarmDrone(DroneAbstract):
         self._t = 0
         self._origin = int(self.identifier) if identifier is not None and 0 <= int(identifier) < MAX_ORIGINS else None
         self._debug_group = None
+        self._t_limit = getattr(misc_data, "max_timestep_limit", None)
 
     def _ensure_brain(self):
         if self._brain is None:
             origin = self._origin if self._origin is not None else (abs(hash(self.identifier)) % MAX_ORIGINS)
-            self._brain = Brain(origin, self.size_area, Params())
+            self._brain = Brain(origin, self.size_area, Params(), t_limit=self._t_limit)
 
     def define_message_for_all(self):
         # Les messages sont diffusés avant control() : on envoie l'état construit au pas précédent.

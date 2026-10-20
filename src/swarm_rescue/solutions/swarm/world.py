@@ -47,6 +47,11 @@ REFRESH = {ObjKind.WOUNDED: 30}
 # covariance d'une piste tombe à quelques px² et un blessé qui a bougé de 20 px sort de la porte : nouvelle piste,
 # l'ancienne reste « vue » à un endroit vide (blessé imaginaire)
 PROCESS_Q = {ObjKind.WOUNDED: 4.0}
+# blessé fixe / mobile (d'après mes observations) : fixe = vu sur WOUNDED_FIXED_T pas sans s'écarter de WOUNDED_FIXED_DEV px
+# de sa 1re position (bruit de mesure et de pose compris) ; mobile dès WOUNDED_MOVING_DEV px
+WOUNDED_FIXED_T = 60
+WOUNDED_FIXED_DEV = 10.0
+WOUNDED_MOVING_DEV = 20.0
 PROCESS_DT_MAX = 100
 
 
@@ -167,6 +172,7 @@ class WorldModel:
         self.objects: dict[tuple[int, int], ObjectTrack] = {}
         self.obj_known = np.zeros(MAX_ORIGINS, dtype=np.int64)   # vecteur de versions des objets (cf. schema.py)
         self._own: dict[tuple[int, int], tuple] = {}             # estimation interne de mes pistes : (pos, P, t_seen)
+        self._motion: dict = {}          # mes pistes de blessés : [ancre (estimation filtrée), instant, écart max, nb d'obs.]
         self._pending: dict = {}                                 # plages reçues hors séquence, par (flux, origine)
         self._agent_seq = 0
         self._next_local = 0
@@ -200,7 +206,8 @@ class WorldModel:
         return a
 
     def observe_object(self, kind: ObjKind, pos, t: int,
-                       state: ObjState = ObjState.SEEN, cov=None, floor_var: float = 0.0) -> ObjectTrack:
+                       state: ObjState = ObjState.SEEN, cov=None, floor_var: float = 0.0,
+                       anchor_fixed: bool = False) -> ObjectTrack:
         """Crée ou met à jour MA piste de même nature qui correspond à la mesure (porte de Mahalanobis si `cov`).
         Avec `cov` (covariance 2x2 de la mesure, monde) : filtre de Kalman sur la position, avec un plancher
         `floor_var` (incertitude de MA pose, commune à toutes mes observations : elle ne se moyenne pas)."""
@@ -227,10 +234,18 @@ class WorldModel:
             tr = ObjectTrack(self.me, self._next_local, 0, kind, pos, t, state, fusion.cov_pack(P0))
             self._next_local += 1
             self._own[tr.key] = (np.array(pos), P0, t)
+            if kind == ObjKind.WOUNDED:
+                self._motion[tr.key] = [None, t, 0.0, 1]
             return self._publish(tr)
         own = self._own.get(best.key) or (np.array(best.pos), fusion.cov_unpack(best.cov), best.t_seen)
         new_state = ObjState.RESCUED if best.state == ObjState.RESCUED else state
         mu, P = own[0], own[1]
+        mot = self._motion.get(best.key) if kind == ObjKind.WOUNDED else None
+        if anchor_fixed and state == ObjState.SEEN and self.motion_class(best.key) == "fixed":
+            # blessé fixe servant d'amer sans GPS : sa position n'est plus réestimée avec une pose qui dérive
+            self._own[best.key] = (own[0], own[1], t)
+            stale = kind in REFRESH and t - best.t_seen >= REFRESH[kind]
+            return self._publish(replace(best, t_seen=t)) if stale else best
         if q > 0.0 and state != ObjState.CARRIED:        # le blessé a pu bouger depuis la dernière mesure
             P = P + q * min(max(t - own[2], 0), PROCESS_DT_MAX) * np.eye(2)
         if state == ObjState.CARRIED:                    # un blessé porté ne déplace pas sa piste ici
@@ -241,6 +256,15 @@ class WorldModel:
             a = SMOOTH.get(kind, 1.0)
             mu = mu + a * (np.array(pos) - mu)
         self._own[best.key] = (np.array(mu, float), P, t)
+        if mot is not None and state == ObjState.SEEN:
+            # écart de l'estimation FILTRÉE à une ancre prise après 5 observations (une mesure brute peut être fausse
+            # de 13 px : relèvement sémantique discrétisé à ~10°)
+            mot[3] += 1
+            if mot[0] is None:
+                if mot[3] >= 5:
+                    mot[0], mot[1] = np.array(mu, float), t
+            else:
+                mot[2] = max(mot[2], math.hypot(mu[0] - mot[0][0], mu[1] - mot[0][1]))
         # publication seulement si utile : état, déplacement, incertitude nettement réduite, ou rafraîchissement
         moved = math.hypot(mu[0] - best.pos[0], mu[1] - best.pos[1])
         shrunk = P[0, 0] + P[1, 1] < 0.8 * (best.cov[0] + best.cov[2])
@@ -249,6 +273,26 @@ class WorldModel:
             return best
         return self._publish(replace(best, pos=(float(mu[0]), float(mu[1])), t_seen=t, state=new_state,
                                      cov=fusion.cov_pack(P)))
+
+    def motion_class(self, key) -> str:
+        """Ma piste de blessé : "fixed" (vue >= WOUNDED_FIXED_T pas sans bouger de plus de WOUNDED_FIXED_DEV px),
+        "moving" (a bougé de plus de WOUNDED_MOVING_DEV px : définitif), sinon "unknown"."""
+        mot = self._motion.get(key)
+        if mot is None:
+            return "unknown"
+        if mot[2] > WOUNDED_MOVING_DEV:
+            return "moving"
+        if mot[0] is not None and mot[2] < WOUNDED_FIXED_DEV \
+                and self._own.get(key, (None, None, mot[1]))[2] - mot[1] >= WOUNDED_FIXED_T:
+            return "fixed"
+        return "unknown"
+
+    def wounded_class(self, obj: "FusedObject") -> str:
+        """Classe d'un blessé fusionné d'après MES pistes du groupe (mobile si l'une a bougé)."""
+        cls = [self.motion_class(k) for k in obj.sources if k[0] == self.me]
+        if "moving" in cls:
+            return "moving"
+        return "fixed" if "fixed" in cls else "unknown"
 
     def set_state(self, key, state: ObjState, t: int) -> Optional[ObjectTrack]:
         """Change l'état d'une de MES pistes (ex. la piste d'un blessé que je viens de déposer)."""

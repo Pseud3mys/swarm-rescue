@@ -47,37 +47,99 @@ class ScanIntegrator:
         if sig > p.max_pose_sigma_for_mapping:
             return 0
         r = np.asarray(ranges, float)
+        ang = np.asarray(angles, float)
         ok = np.isfinite(r)
-        # Un rayon sans impact vaut 300 + bruit : seul un retour à plus de 3σ sous la portée max est un impact, et un
-        # rayon qui n'en est pas un n'écrit du libre que jusque-là (un mur réel vers 295 px ne doit pas être effacé).
+        # Un rayon sans impact vaut 300 + bruit : seul un retour à plus de 3σ sous la portée max est un impact. Un mur
+        # vers 290-300 px renvoie tantôt un impact, tantôt « portée max » : un rayon sans impact n'écrit donc du libre
+        # que jusqu'à map_far_buffer avant cette limite (sinon la cellule du mur alterne mur / libre).
         r_max = p.lidar_max_range - 3.0 * p.lidar_sigma
         hit = ok & (r < r_max) & (r > 3.0)
         if ignore is not None:
             hit &= ~ignore
-        a = pose.theta + np.asarray(angles, float)
+        a = pose.theta + ang
         c, s = np.cos(a), np.sin(a)
-        reach = np.where(ok, np.where(hit, r - 0.7 * m.res, r_max), 0.0)
+        reach = np.where(ok, np.where(hit, r - self._free_margin(pose, r, ang, hit), r_max - p.map_far_buffer), 0.0)
         if ignore is not None:       # derrière/sur un autre drone : on ne sait rien de plus que sa distance
             reach = np.where(ignore & ok, np.maximum(r - 25.0, 0.0), reach)
+        # rayons fiables : impact continu avec ses voisins (pas un rayon qui a « glissé » à travers un mur), incidence
+        # franche (en incidence rasante un rayon peut passer entre deux pixels de mur), portée moyenne
+        cont, sinb = _surface(r, ang, hit)
+        rel_hit = hit & cont & (r < p.map_rel_range)
+        rel = rel_hit & (sinb >= p.map_rel_sin)
         S = self.samples[None, :]
         valid = S <= reach[:, None]
         xs = pose.x + c[:, None] * S
         ys = pose.y + s[:, None] * S
-        ix, iy = m.world_to_cell(np.stack((xs[valid], ys[valid]), axis=1))
         free, hits = self._free, self._hit
         free[:] = False
         hits[:] = False
+        ix, iy = m.world_to_cell(np.stack((xs[valid], ys[valid]), axis=1))
         free[ix, iy] = True
+        hx_w, hy_w = pose.x + c * r, pose.y + s * r
         if hit.any():
-            hx, hy = m.world_to_cell(np.stack((pose.x + c[hit] * r[hit], pose.y + s[hit] * r[hit]), axis=1))
+            hx, hy = m.world_to_cell(np.stack((hx_w[hit], hy_w[hit]), axis=1))
             hits[hx, hy] = True
         free &= ~hits
+        L = m.layers.get(self.w.me)
+        if L is not None and p.map_lock <= 20:
+            # cellules CERTAINES de ma couche (monde statique : drones et blessés sont masqués) : seuls des rayons
+            # fiables peuvent les contredire. Sinon un drone garé efface petit à petit un mur vu en rasant ou en bout
+            # de portée, et des impacts lointains bruités épaississent les murs dans du vide sûr.
+            vr = valid & rel[:, None]
+            free_rel = np.zeros_like(free)
+            jx, jy = m.world_to_cell(np.stack((xs[vr], ys[vr]), axis=1))
+            free_rel[jx, jy] = True
+            free &= (L < p.map_lock) | free_rel
+            hit_rel = np.zeros_like(hits)
+            if rel_hit.any():
+                kx, ky = m.world_to_cell(np.stack((hx_w[rel_hit], hy_w[rel_hit]), axis=1))
+                hit_rel[kx, ky] = True
+            hits &= (L > -p.map_lock) | hit_rel
         fx, fy = np.nonzero(free)
         hx, hy = np.nonzero(hits)
         ev_hit = p.ev_hit if sig < 6.0 else (2 if sig < 10.0 else 1)
-        m.add_evidence(self.w.me, np.r_[fx, hx], np.r_[fy, hy],
-                       np.r_[np.full(fx.size, p.ev_free), np.full(hx.size, ev_hit)])
+        far = np.zeros_like(hits)
+        if (hit & (r > p.map_far_hit)).any():         # impacts lointains : décalage latéral (cap) plus grand
+            far_ray = hit & (r > p.map_far_hit)
+            ux, uy = m.world_to_cell(np.stack((hx_w[far_ray], hy_w[far_ray]), axis=1))
+            far[ux, uy] = True
+            near_ray = hit & ~far_ray
+            if near_ray.any():
+                vx, vy = m.world_to_cell(np.stack((hx_w[near_ray], hy_w[near_ray]), axis=1))
+                far[vx, vy] = False
+        ev_h = np.where(far[hx, hy], min(ev_hit, 1), ev_hit)
+        m.add_evidence(self.w.me, np.r_[fx, hx], np.r_[fy, hy], np.r_[np.full(fx.size, p.ev_free), ev_h])
         return int(fx.size + hx.size)
+
+    def _free_margin(self, pose: Pose, r: np.ndarray, angles: np.ndarray, hit: np.ndarray) -> np.ndarray:
+        """Longueur de rayon (avant l'impact) sans preuve libre. Un rayon qui arrive sur un mur avec un angle beta
+        passe à moins d'une cellule du mur sur res / sin(beta) avant l'impact : il traverse la partie vide de la
+        cellule du mur, et un drone qui ne voit un mur qu'en rasant (garé) l'effacerait petit à petit. Optionnel : en
+        plus, le décalage dû à la pose (sigma_xy + r * sigma_cap). Mur local estimé par les impacts voisins."""
+        p, m = self.p, self.w.map
+        base = 0.7 * m.res
+        lat = np.full(r.shape, p.map_margin_cell * m.res)
+        if p.map_margin_k > 0.0:
+            sth = math.sqrt(max(float(pose.cov[2, 2]), 0.0))
+            lat = lat + p.map_margin_k * (pose.sigma + np.where(np.isfinite(r), r, 0.0) * sth)
+        if not lat.any():
+            return np.full(r.shape, base)
+        cont, sinb = _surface(r, angles, hit)
+        sinb = np.where(cont, np.maximum(sinb, 0.1), 1.0)
+        return np.maximum(base, np.minimum(lat / sinb, p.map_margin_max))
+
+
+def _surface(r: np.ndarray, angles: np.ndarray, hit: np.ndarray):
+    """Par rayon : impact continu avec ses deux voisins (même surface), et sinus de l'angle entre le rayon et cette
+    surface (estimée par les impacts voisins ; 1 = incidence normale, ~0 = rasante)."""
+    rr = np.where(np.isfinite(r), r, 0.0)
+    x, y = rr * np.cos(angles), rr * np.sin(angles)
+    n = len(r)
+    prv, nxt = (np.arange(n) - 1) % n, (np.arange(n) + 1) % n
+    cont = hit[prv] & hit[nxt] & (np.abs(rr[nxt] - rr) < 6.0 + 0.08 * rr) & (np.abs(rr - rr[prv]) < 6.0 + 0.08 * rr)
+    tx, ty = x[nxt] - x[prv], y[nxt] - y[prv]
+    sinb = np.abs(np.cos(angles) * ty - np.sin(angles) * tx) / np.maximum(np.hypot(tx, ty), 1e-6)
+    return cont, sinb
 
 
 def _mask_bodies(mask, ranges, angles, rel_bearing, dist, radius) -> np.ndarray:

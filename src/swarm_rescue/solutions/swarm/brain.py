@@ -25,6 +25,7 @@ from .landmarks import LandmarkTracker
 from .missions import MissionPlanner
 from .pathing import PlanGrid, extra_cost_from_agents
 from .perception import ScanIntegrator, dynamic_ray_mask, observe_semantic
+from .scanmatch import ScanMatcher
 from .schema import Command, Mission, MissionKind, ObjKind, ObjState, Packet, Route, SensorFrame
 from .teamplan import TeamPlanner
 from .world import WorldModel
@@ -32,15 +33,19 @@ from .monitoring import MissionMonitor
 
 
 class Brain:
-    def __init__(self, me: int, size_area, params: Optional[Params] = None):
+    def __init__(self, me: int, size_area, params: Optional[Params] = None, t_limit: Optional[int] = None):
         self.p = p = params or Params()
         self.me = me
+        self.t_limit = t_limit          # pas de fin de partie (misc_data) : retour à la zone de départ avant
+        self._homing = False
+        self._home_xy = None            # ma position de départ (dans la zone de retour)
         self.world = WorldModel(me, size_area, p.resolution, p.chunk)
         self.gossip = Gossip(self.world, GossipConfig())
         self.monitor = MissionMonitor(os.environ.get("SWARM_MONITOR"))
         self.ekf = PoseEKF(p)
         self.landmarks = LandmarkTracker(self.world, self.ekf, p, min_gap=30)
         self.scan = ScanIntegrator(self.world, p)
+        self.matcher = ScanMatcher(self.world, p)
         self.planner = MissionPlanner(self.world, p)
         self.team = TeamPlanner(self.world, p, self.planner)
         self.follower = PathFollower(p)
@@ -102,7 +107,7 @@ class Brain:
         # ---- estimation
         self.ekf.predict(f.odom, f.gps is not None, f.compass is not None,
                          (self.last_cmd.forward, self.last_cmd.lateral), self.last_cmd.rotation,
-                         accel=p.accel_per_cmd_carry if f.carrying else p.accel_per_cmd)
+                         accel=p.accel_per_cmd_carry if f.carrying else p.accel_per_cmd, carrying=f.carrying)
         self.ekf.update_gps(f.gps, f.compass)
         self.ekf.update_compass(f.compass)
         if not self.ekf.initialized:
@@ -119,8 +124,20 @@ class Brain:
         if not self._home_set and f.in_return_area:
             w.observe_object(ObjKind.RETURN_AREA, pose.pos, t)
             self._home_set = True
+            self._home_xy = pose.pos.copy()
         if f.lidar is not None and t % 2 == 0:       # un scan sur deux suffit (on bouge de < 5 px par pas)
             mask = dynamic_ray_mask(f.lidar, f.angles, f.semantic, pose, self._bodies(t))
+            # recalage sur la carte AVANT d'y graver ce scan. Avec GPS : l'EKF (modèle de mouvement + GPS + boussole)
+            # suffit, seul le recalage sur la carte des AUTRES drones apporte une information (tous les sm_pose_period
+            # pas : coût). Sans GPS : en plus, cap recalé sur ma carte à chaque scan (en portant, le couple du blessé
+            # rend le cap incertain : seule la carte le tient)
+            gps_mode = f.gps is not None
+            if p.sm_enabled and (not gps_mode or t % p.sm_pose_period == 0):
+                fix = self.matcher.match(t, pose, f.lidar, f.angles, mask, compass_ok=f.compass is not None,
+                                         want_pose=t % p.sm_pose_period == 0, use_own=not gps_mode)
+                if fix is not None and (self.ekf.update_pose(fix[1], fix[2]) if fix[0] == "pose"
+                                        else self.ekf.update_heading(fix[1], fix[2])):
+                    pose = self.ekf.pose()
             self.scan.integrate(pose, f.lidar, f.angles, mask)
         seen = observe_semantic(w, pose, f.semantic, t, p)
         if t % 2 == 1:
@@ -292,6 +309,9 @@ class Brain:
         if self._plan_reason in ("carry-change", "stuck", "conflict"):
             r, self._plan_reason = self._plan_reason, ""
             return r
+        if not self._homing and t % 10 == 0 and self._time_to_go_home(t, pose):
+            self._homing = True
+            return "homing"
         if self.route is None and t - self._last_plan >= 10:
             return "no-route"
         if t - self._last_plan >= p.replan_period:
@@ -312,6 +332,18 @@ class Brain:
                     return None
                 return "arrived"
         return None
+
+    def _time_to_go_home(self, t, pose) -> bool:
+        """Fin de partie : seuls les drones DANS la zone de retour comptent pour le score de retour (20 %). On rentre
+        quand le temps restant approche la durée du trajet (route depuis la base sur la grille d'équipe, à vitesse
+        réduite) plus une marge."""
+        p = self.p
+        if self.t_limit is None or self._home_xy is None or t < self.t_limit - p.home_window:
+            return False
+        G = self.team.grid
+        r = G.route_to(pose.pos, t, p.v_cruise) if G is not None else None
+        L = r.length if r is not None else 1.5 * float(np.linalg.norm(pose.pos - self._home_xy))
+        return t + L / (p.home_speed_frac * p.v_cruise) + p.home_margin >= self.t_limit
 
     def _route_blocked(self, pose) -> bool:
         """Les 150 prochains px de la route traversent-ils un obstacle connu ?"""
@@ -346,6 +378,20 @@ class Brain:
             return
         extra = extra_cost_from_agents(w, t, w.map, (w.map.W, w.map.H), self.me)
         route, chosen = None, None
+        if self._homing and not f.carrying and self._home_xy is not None:     # fin de partie : retour au départ
+            for k in (None, p.inflate_cells_tight):
+                grid = PlanGrid(w, p, pose.pos, inflate=k, extra_cost=extra)
+                grid.solve()
+                route = grid.route_to(self._home_xy, t, self._speed(False))
+                if route is not None:
+                    self.mission = Mission(MissionKind.RETURN, (float(self._home_xy[0]), float(self._home_xy[1])), t)
+                    self.mission_src = "homing"
+                    self.route = route
+                    self.follower.set_route(route)
+                    self._arrived_t = None
+                    self._stuck = 0
+                    self.timing["n_plan"] += 1
+                    return
         # porteur : le blessé dépasse du drone, on planifie avec plus de marge aux murs (repli si injoignable)
         inflates = (p.inflate_cells_carry, None, p.inflate_cells_tight) if f.carrying else (None, p.inflate_cells_tight)
         # dépose en cours : on la termine (aller prendre le blessé, puis le porter devant la porte), sauf si le blessé à

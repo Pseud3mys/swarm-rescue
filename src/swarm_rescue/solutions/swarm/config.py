@@ -40,6 +40,14 @@ class Params:
     landmark_sigma_b: float = math.radians(1.5)
     gate_chi2: float = 11.0
     accel_model_trust: float = 0.15    # écart-type d'accélération non modélisée (px/pas^2)
+    # modèle de mouvement de l'EKF (mesuré, cf. estimator.py) : bien plus précis que l'odomètre hors chocs
+    rot_model_sigma: float = math.radians(0.12)        # rotation = commande x ang_per_cmd (résidu mesuré 0,07°)
+    rot_model_sigma_carry: float = math.radians(2.0)   # en portant : couple du blessé (résidu mesuré 1,9°)
+    rot_shock_deg: float = 4.0         # écart modèle / odomètre au-delà duquel on suit l'odomètre (choc)
+    vel_model_sigma: float = 0.08      # px/pas : vitesse = frottement + accel x commande (résidu mesuré 0,06)
+    vel_model_sigma_carry: float = 0.25
+    vel_model_sigma_blind: float = 0.4 # odomètre coupé
+    shock_vel_var: float = 1.0         # px² : incertitude ajoutée à la vitesse quand l'odomètre contredit le modèle
 
     # ---- carte ------------------------------------------------------------------------------------
     resolution: float = 8.0
@@ -47,6 +55,29 @@ class Params:
     ev_free: int = -1
     ev_hit: int = 3
     max_pose_sigma_for_mapping: float = 14.0
+    map_margin_cell: float = 1.0       # rayons libres arrêtés à map_margin_cell cellules du mur (/ sin incidence)
+    map_margin_k: float = 0.0          # rayons libres arrêtés avant l'impact de k x (décalage dû à la pose) / sin(incidence)
+    map_margin_max: float = 60.0       # px
+    map_lock: int = 12                 # |log-odds| de MA couche à partir duquel une cellule est certaine (mur / vide) :
+                                       # seuls des rayons fiables la contredisent
+    map_rel_range: float = 200.0       # px : rayon fiable = impact continu, à moins de ça ...
+    map_rel_sin: float = 0.5           # ... et incidence franche (sin de l'angle rayon / mur)
+    map_far_buffer: float = 16.0       # px : un rayon sans impact n'écrit pas de libre dans les 2 cellules avant sa portée
+    map_far_hit: float = 250.0         # px : impact plus loin que ça : poids 1 (décalage latéral dû au cap)
+    # recalage scan -> carte (scanmatch.py)
+    sm_enabled: bool = True
+    sm_field_period: int = 10          # pas : champs lissés de la carte recalculés à cette cadence
+    sm_pose_period: int = 6            # pas : recalage en position (les autres pas : cap seul)
+    sm_occ_sat: float = 10.0           # log-odds : mur « sûr » (saturation du champ d'occupation)
+    sm_min_points: int = 30
+    sm_min_score: float = 0.5          # occupation moyenne aux impacts après recalage
+    sm_max_dth: float = 8.0            # deg : correction max acceptée
+    sm_max_dxy: float = 15.0           # px
+    sm_res_floor: float = 0.15         # plancher de l'écart-type des résidus (occupation, sans unité)
+    sm_n_eff: int = 10                 # points réellement indépendants (erreurs de carte corrélées)
+    sm_floor_xy: float = 2.5           # px : plancher de la mesure (la carte des autres a sa propre erreur)
+    sm_floor_th: float = 0.7           # deg
+    sm_own_floor_th: float = 1.5       # deg : cap recalé sur MA carte alors que la boussole marche
     # capteur sémantique (drone_semantic_sensor.py) : distance + N(2.5, 1) (biais +2,5 px, écart-type 1 :
     # np.random.normal(2.5) prend 2.5 comme MOYENNE), angle exact mais discrétisé (35 rayons, 10,3°) ;
     # la distance va jusqu'à la SURFACE du blessé (rayon 12)
@@ -141,6 +172,9 @@ class Params:
     handoff_timeout: int = 200         # pas : passage de relais abandonné au-delà
     recover_steps: int = 30            # durée de la manœuvre de dégagement après un blocage
     drop_check_steps: int = 20         # après une dépose, un blessé encore visible n'est PAS sauvé
+    home_window: int = 2500            # pas avant la fin à partir desquels on évalue le retour au départ
+    home_speed_frac: float = 0.6       # vitesse moyenne de retour (freinages, virages, croisements) / v_cruise
+    home_margin: int = 120             # pas de marge
     # ---- blessés imaginaires (pistes périmées, blessés mobiles) ---------------------------------------
     vanish_check_dist: float = 110.0   # px : un blessé connu plus près que ça, en vue directe (lidar) et absent ...
     vanish_checks: int = 4             # ... à N contrôles consécutifs (un pas sur deux) est retiré de la carte
