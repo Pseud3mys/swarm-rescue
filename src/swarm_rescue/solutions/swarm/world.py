@@ -11,6 +11,13 @@ Objets (blessés, centre de secours, amers) :
     réduite, changement d'état) : l'estimation interne continue de s'affiner entre deux publications ;
   - à la lecture, `fuse_tracks` associe les pistes des différents drones (porte de Mahalanobis, ordre déterministe :
     tous les drones qui ont les mêmes pistes obtiennent les mêmes objets) et les fusionne par somme d'informations.
+
+Blessés :
+  - bruit de processus (PROCESS_Q) : un blessé mobile reste associé à sa piste au lieu d'en créer une nouvelle ;
+  - classe de mouvement par piste (`motion_class` : fixe / mobile / inconnue, d'après MES observations) ; sans GPS,
+    un blessé fixe garde sa position (`observe_object(anchor_fixed=True)`) et sert d'amer à l'EKF (brain.py) ;
+  - `mark_gone` : blessé vérifié absent (imaginaire, parti, déjà pris) -> mes pistes TAKEN + pierre tombale qui
+    masque celles des autres drones ; une observation plus récente le fait réapparaître.
 """
 from __future__ import annotations
 
@@ -47,8 +54,9 @@ REFRESH = {ObjKind.WOUNDED: 30}
 # covariance d'une piste tombe à quelques px² et un blessé qui a bougé de 20 px sort de la porte : nouvelle piste,
 # l'ancienne reste « vue » à un endroit vide (blessé imaginaire)
 PROCESS_Q = {ObjKind.WOUNDED: 4.0}
-# blessé fixe / mobile (d'après mes observations) : fixe = vu sur WOUNDED_FIXED_T pas sans s'écarter de WOUNDED_FIXED_DEV px
-# de sa 1re position (bruit de mesure et de pose compris) ; mobile dès WOUNDED_MOVING_DEV px
+# blessé fixe / mobile (d'après mes observations) : fixe = estimation filtrée restée à moins de WOUNDED_FIXED_DEV px de
+# son ancre (estimation après 5 observations) pendant WOUNDED_FIXED_T pas (bruit de mesure et de pose compris) ;
+# mobile dès WOUNDED_MOVING_DEV px (définitif)
 WOUNDED_FIXED_T = 60
 WOUNDED_FIXED_DEV = 10.0
 WOUNDED_MOVING_DEV = 20.0

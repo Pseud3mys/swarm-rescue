@@ -50,7 +50,7 @@ class Params:
     vel_model_sigma: float = 5.0
     vel_model_sigma_carry: float = 5.0
     vel_model_sigma_blind: float = 0.4 # odomètre coupé
-    odo_th_coupling: bool = True       # la mesure odométrique corrige-t-elle aussi le cap (bruit d'angle 8° : non)
+    odo_th_coupling: bool = True       # la mesure odométrique (direction du déplacement, bruit 8°) corrige aussi le cap
     shock_vel_var: float = 1.0         # px² : incertitude ajoutée à la vitesse quand l'odomètre contredit le modèle
 
     # ---- carte ------------------------------------------------------------------------------------

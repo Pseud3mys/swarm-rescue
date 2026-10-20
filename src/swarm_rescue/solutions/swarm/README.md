@@ -13,138 +13,185 @@ Tests (sans le vrai simulateur) : `cd tests && PYTHONPATH=../solutions:. python3
 | Fichier | Rôle | Lit | Écrit |
 |---|---|---|---|
 | `schema.py` | formats de données (le contrat) | | |
-| `config.py` | tous les paramètres (dynamique, capteurs, réglages) | | |
-| `estimator.py` | EKF 6 états (pose + biais GPS/compas AR(1)), filtre de vitesse, `update_landmark` générique | capteurs | `Pose` |
+| `config.py` | tous les paramètres (dynamique, capteurs, réglages), commentés avec leur justification | | |
+| `estimator.py` | EKF 8 états (pose, vitesse, biais GPS / boussole AR(1)) avec modèle de mouvement mesuré ; filtre de vitesse séparé pour le contrôle ; mises à jour GPS, boussole, amer, recalage de carte | capteurs | `Pose` |
 | `landmarks.py` | coins de mur : extraction lidar, association Mahalanobis, recalage de l'EKF sur l'estimation de l'essaim moins la sienne, contribution avec covariance | scan, EKF | objets `CORNER` |
-| `perception.py` | lidar → carte (preuves pondérées par l'incertitude de pose, corps mobiles masqués), sémantique → objets | `Pose`, capteurs | `WorldModel` |
-| `gridmap.py` / `world.py` | carte par tuiles (une couche par drone, révision seulement si le contenu change), agents, objets (une contribution fusionnée par drone, association + fusion à la lecture) | | |
+| `scanmatch.py` | recalage scan -> carte (champ d'occupation lissé, Gauss-Newton) : pose sur les murs des autres, cap sur ma carte | lidar, carte | mesure pour l'EKF |
+| `perception.py` | lidar -> MA couche de carte (règles anti-effacement / anti-épaississement, corps mobiles masqués) ; sémantique -> pistes d'objets avec covariance | `Pose`, capteurs | `WorldModel` |
+| `gridmap.py` | carte par tuiles, une couche de log-odds par drone, somme à la lecture, révision seulement si le contenu change | | |
+| `world.py` | agents et objets : une piste fusionnée par drone et par objet, bruit de processus et classe fixe / mobile des blessés, pierres tombales, association + fusion à la lecture | | |
+| `fusion.py` | gaussiennes 2D : forme information, fusion indépendante, Kalman à plancher, Mahalanobis | | |
 | `comms.py` | gossip à vecteurs de versions (plages complètes, résumé de taille fixe) : ne dépend que de `WorldModel` | paquets | paquet sortant |
 | `pathing.py` | grille gonflée, Dijkstra scipy (coût de tous les buts en une passe), frontières | `WorldModel` | `Route` |
 | `missions.py` | QUOI faire : porter, blessé libre, frontière, retour ; coordination par missions annoncées | coûts de `PlanGrid` | `Mission` |
-| `controller.py` | asservissement en vitesse, freinage, évitement | `Pose`, `Route`, lidar | `Command` |
-| `brain.py` | séquencement et événements (replanification, blocage, saisie/dépose) | tout | `Command`, `Packet` |
-| `monitoring.py` | télémétrie JSONL et détection d'informations radio périmées, changements de rôle et oscillations | `Brain` | journal JSONL |
-| `drone.py` | seul fichier qui touche au simulateur | `DroneAbstract` | |
-| `network.py` | image du réseau radio (liens entendus / prévus, composantes) | `WorldModel` | |
 | `teamplan.py` | allocation par réseau connexe : dépose, meneurs (le plus proche, en profondeur), relais derrière eux, suiveurs, blessés/base (hongrois) | `PlanGrid`, `WorldModel` | `Mission` par drone |
 | `topo.py` | carte topologique : pièces / portes / couloirs (ouverture morphologique), arbre depuis la base, axes de passage | `PlanGrid` | `TopoMap` |
-| `fusion.py` | gaussiennes 2D : forme information, fusion indépendante, Kalman à plancher, Mahalanobis | | |
-| `../debug_view.py` | fenêtre Qt de debug (carte de chaque drone + vue essaim), `SWARM_DEBUG=0` pour la couper | | |
+| `network.py` | image du réseau radio (liens entendus / prévus, composantes) | `WorldModel` | |
+| `controller.py` | asservissement en vitesse, freinage, évitement | `Pose`, `Route`, lidar | `Command` |
+| `brain.py` | séquencement et événements : ordre des recalages, blessés fixes comme amers, contrôle négatif des blessés, saisie / dépose, replanification, blocage, retour en fin de partie | tout | `Command`, `Packet` |
+| `monitoring.py` | télémétrie JSONL et détection d'informations radio périmées, changements de rôle et oscillations | `Brain` | journal JSONL |
+| `drone.py` | seul fichier qui touche au simulateur | `DroneAbstract` | |
+| `../debug_view.py` | fenêtre Qt de debug (carte de chaque drone + vue essaim, classes de blessés), `SWARM_DEBUG=0` pour la couper | | |
 
-Un pas : radio → EKF (+ amers) → carte/objets → mission+chemin (sur événement seulement) → vitesse → publication de l'état aux voisins.
+## Un pas de `Brain.step`
 
-## Ce que les fichiers du simulateur ont changé
-- Drone commandé en **force** (accélération max ≈ 0,0067 px/pas²), frottement quasi nul : freiner de 1,5 px/pas demande > 150 px. Rotation ≈ 0,006 rad/pas. D'où : pilotage en vitesse holonome, **cap maintenu**, vitesse plafonnée par la distance de freinage (fin de route, virages, lidar).
-- Bruit GPS/compas AR(1) (φ=0,98), **gelé** quand le capteur est coupé : le biais est un état de l'EKF et n'évolue que si le capteur marche.
-- Le bruit de θ de l'odomètre (1°/pas) dépasse la rotation réelle : le cap est prédit par le modèle, l'odomètre n'est utilisé qu'en cas de vraie rotation.
+1. **Radio** : paquets reçus -> `WorldModel` (cartes, objets, agents des autres).
+2. **Prédiction EKF** (modèle de mouvement + odomètre), puis GPS et boussole s'ils marchent.
+3. **Coins** (`landmarks.py`) : tous les 4 pas avec GPS, tous les 2 pas sans.
+4. **Lidar** (un scan sur deux) : masque des corps mobiles -> **recalage scan -> carte** (`scanmatch.py`) AVANT
+   d'écrire le scan -> **intégration** dans ma couche (`perception.py`).
+5. **Sémantique** : blessés / centre de secours -> pistes ; sans GPS, **blessés fixes = amers** pour l'EKF ;
+   **contrôle négatif** des blessés connus (un pas sur deux) ; effacement des impacts lidar gravés sur les blessés.
+6. Saisie / dépose (pistes du blessé porté), mission + chemin (sur événement), asservissement.
+7. Publication de mon état (position, σ de pose, mission, route) et construction du paquet sortant.
 
-## Résultats sur le mini-simulateur (`tests/tools/toysim.py`, mêmes modèles de bruit)
-- Position : EKF 3,5 px RMS contre 6,6 px pour le GPS brut ; cap 2,2° contre 3,9° ; 5,3 px après 500 pas sans GPS.
-- Recalage sur amers : 15 px d'erreur → ~2 px en 400 pas, GPS coupé (test unitaire `test_landmarks.py`).
-- 3 drones, 3000 pas : 4 blessés sur 6 sauvés, 0 collision, ~2 ms de calcul par pas et par drone.
-- Radio coupée 1500 pas puis rétablie : les cartes (42-54 %) convergent vers l'union (~75 %).
-- Murs de la carte : aucune cellule à plus d'une cellule d'un vrai mur.
+## Faits mesurés sur le simulateur (à la base des choix)
+- Un pas = 1 s de physique ; vitesse : `v_k = 0,95 v_{k-1} + 0,55 x commande` px/pas (0,18 en portant : masse x3) ;
+  rotation = commande x 0,176 rad/pas. Le contrôle pilote en vitesse holonome, cap maintenu, vitesse plafonnée par
+  la distance de freinage (cf. `controller.py`).
+- GPS / boussole : biais AR(1) (φ = 0,98, σ = 5 px / 4°), **gelé** quand le capteur est coupé.
+- Odomètre : distance σ 0,2 px, direction σ 8°, **cap σ 1°/pas** (marche aléatoire de ~30° en 1000 pas).
+- Lidar : σ = 2,5 px sur TOUS les rayons, y compris sans impact (300 + bruit) ; portée 300 px.
+- Sémantique : distance jusqu'à la SURFACE du blessé (rayon 12) avec un biais de +2,5 px (σ 1) ; angle exact mais
+  discrétisé (35 rayons, ~10°) ; portée 200 px.
+- `received_messages` : `[(Communicator, message)]`, objets passés par référence (d'où l'immutabilité des messages).
 
-## Monitoring d'une exécution
+## Estimation de pose (`estimator.py`, `landmarks.py`, `scanmatch.py`, `brain.py`)
 
-Le monitoring est désactivé par défaut. Pour enregistrer chaque drone sans modifier le
-launcher, définir `SWARM_MONITOR` et utiliser son mode headless existant :
+### Filtre
+EKF à 8 états `[x, y, θ, vx, vy, bx, by, bθ]` : pose, déplacement du dernier pas, biais GPS et boussole. Les biais
+sont des états AR(1) qui n'évoluent que si leur capteur fonctionne. Modèle de mouvement mesuré sur le vrai simulateur
+(MapIntermediate01) :
 
-    $env:SWARM_DEBUG = "0"
-    $env:SWARM_MONITOR = "monitor\map_medium_02.jsonl"
-    & .\.venv\Scripts\python.exe .\src\swarm_rescue\launcher.py --config .\config\my_eval_plan.yml --headless
+- **Cap** : l'incrément est la fusion modèle (commande x 0,176, résidu 0,07°/pas) + odomètre (1°/pas). L'odomètre
+  seul est pris en cas de **choc** (écart > 4°) et **en portant** : le couple du blessé écarte la rotation du modèle de
+  façon systématique (fusionner biaisait le cap de 30° sans boussole).
+- **Position** : odomètre dominant. Le modèle de vitesse est 3 fois plus précis que l'odomètre sur la vitesse, mais
+  lui faire confiance dégradait la position (petit biais intégré ; en portant, le blessé traîné tire le drone de
+  côté) : `vel_model_sigma` est volontairement large. Un écart odomètre / modèle au-delà de la porte χ² est traité comme
+  un choc (incertitude de vitesse gonflée).
+- **Vitesse du contrôle** : filtre séparé (modèle d'accélération + odomètre), sans effet sur la position.
+- GPS : porte χ² 99,99 %, réaccepté après 20 rejets (filtre perdu). Boussole : porte sur l'innovation.
 
-Le fichier JSONL contient, par drone et par pas, la mission, sa source, l'âge des
-informations de blessés, les voisins réellement entendus, les compteurs gossip, l'état
-de l'exploration et les anomalies détectées (`rescuer-on-stale-info`,
-`stale-agent-info`, `role-oscillation`). Pour afficher la trace ou l'exporter en CSV :
+### Sources de recalage
+| Source | Avec GPS | Sans GPS | Référence utilisée |
+|---|---|---|---|
+| Coins de mur (`landmarks.py`) | seulement sur des coins vus par d'autres et convergés (σ < 3 px), au plus tous les 40 pas par coin | dès qu'un coin connu est revu (tous les 12 pas par coin) | estimation de l'essaim **moins ma contribution** ; la mienne seule sans GPS |
+| Murs des autres (`scanmatch.py`) | pose (x, y, θ) tous les 6 pas | idem | couches des AUTRES drones |
+| Ma carte (`scanmatch.py`) | jamais | cap seul, quand σθ > 1,5° (typiquement en portant) | carte complète ; plancher 1,5° si la boussole marche |
+| Blessés fixes (`brain._wounded_landmarks`) | jamais | distance + relèvement, au plus tous les 10 pas par blessé | position des autres drones si dispo, sinon la mienne figée |
 
-    & .\.venv\Scripts\python.exe -m swarm_rescue.solutions.swarm.monitoring monitor\map_medium_02.jsonl --tail 40
-    & .\.venv\Scripts\python.exe -m swarm_rescue.solutions.swarm.monitoring monitor\map_medium_02.jsonl --csv monitor\map_medium_02.csv
+Pourquoi ces règles :
+- **Jamais de recalage sur ses propres observations quand la pose est bonne** : elles partagent l'erreur de ma pose
+  (auto-confirmation). D'où « essaim moins moi » pour les coins et les murs des autres pour la position.
+- **Ma carte seulement pour le cap, et seulement s'il est vraiment incertain** : le modèle de mouvement tient le cap à
+  ~0,1°/pas ; recaler sur ma carte (dont l'orientation garde le biais de boussole de mon passé) le dégradait (mesuré).
+  En portant (odomètre seul, ~1°/pas), c'est au contraire la seule chose qui tient le cap.
+- **Avec GPS, recalage seulement sur de l'information indépendante et convergée** : elle aide l'EKF à estimer le
+  biais GPS ; un amer peu sûr ne ferait que transférer son erreur.
+- Mesure de recalage de carte : covariance = variance des résidus x H⁻¹, gonflée (points corrélés), avec planchers ;
+  une direction dégénérée (couloir) reçoit une grande variance et l'EKF n'y corrige presque rien. Portes χ² 99,9 %.
 
-## À vérifier sur le vrai simulateur (je n'ai pas pu l'exécuter)
-1. `drone.py::_kind` : noms des types d'entité du capteur sémantique.
-2. ~~Format de `received_messages`~~ : vérifié, `[(Communicator, message)]`, objets passés par référence (d'où l'immutabilité).
-3. Géométrie du centre de secours et condition de sauvetage : `release_dist`, `grasp_dist` dans `config.py`. Après une dépose, un blessé encore visible est considéré non sauvé.
-4. Identifiant du drone : supposé dans 0..15 (`MAX_ORIGINS`).
-5. Gain d'accélération (`accel_per_cmd`) : issu de force/masse ; un essai en boucle ouverte (forward=1 pendant 100 pas, comparer l'odomètre) le confirmerait.
-6. ~~Bruit du lidar~~ : vérifié, σ = 2,5 px sur TOUS les rayons, y compris sans impact (300 + bruit) : seuil d'impact à 300 − 3σ.
+### Coins de mur
+Extraits du scan (deux segments droits quasi perpendiculaires, contigus, 30-120 px). Un coin inconnu n'est publié
+qu'à sa 2e observation (≥ 6 pas plus tard, autre point de vue). Contribution seulement avec une pose sûre (GPS,
+σ < 4,5 px), observations espacées de 30 pas (bruit GPS corrélé sur ~50 pas), arrêt quand le coin a convergé
+(σ < 2 px) : volume radio borné. Association Mahalanobis avec test de rapport (ambigu -> ignoré).
 
-## Limites connues
-- Non codé : zones de destruction / sans radio (les indices `DANGER_HINT`, `NOCOM_HINT` existent dans le schéma ; `extra_cost` de `PlanGrid` permet de les éviter ; `communicator_is_disabled()` n'est pas lu), mission `RELAY` (drone central messager).
-- Blessés mobiles / imaginaires : bruit de processus sur les pistes de blessés (`world.PROCESS_Q`), contrôle négatif
-  (`brain._check_vanished` : blessé connu à < 110 px, en vue directe lidar, absent 4 fois de suite -> pierre tombale
-  TAKEN via `world.mark_gone`), doublons effacés à la saisie, DROP / GOTO abandonnés si la cible n'existe plus.
-  Non fait : la porte d'association ENTRE drones (`fuse_tracks`) ne vieillit pas les pistes (pas d'instant courant).
-- Un drone mort ou muet reste compté dans l'équipe 100 pas (allocation), 400 (porteur), 600 (surcoût de route).
+### Résultats (rejeu hors ligne de l'EKF sur des parties enregistrées, carte 1, 3 parties par config)
+| Mode | erreur p50 / p95 / max (px) | cap |
+|---|---|---|
+| Avec GPS | 4,2 / 8,3 / 13,7 | p50 0,9° |
+| Phase sans GPS | 8,4 / 17,0 / 19,3 | p95 2,9° |
 
-## Estimation de pose (estimator.py) : modèle de mouvement, modes avec / sans GPS
-Mesuré sur le vrai simulateur (MapIntermediate01) : rotation = commande x 0,176 rad à 0,07°/pas près (odomètre :
-1,0°/pas) ; vitesse = 0,95 v + 0,55 x commande à 0,06 px/pas près (odomètre : 0,30). EKF à 8 états (pose, vitesse,
-biais) ; tests par REJEU hors ligne de l'EKF sur des parties enregistrées (entrées capteurs + vérité).
-- Cap : incrément = fusion modèle + odomètre ; odomètre seul en cas de choc (> 4°) et EN PORTANT (le couple du blessé
-  écarte la rotation du modèle de façon systématique : 30° de biais sans boussole sinon).
-- Vitesse : le modèle améliore la vitesse (x3) mais PAS la position (petit biais intégré ; en portant, le blessé traîné
-  tire le drone de côté) : position à odomètre dominant, vitesse du contrôle par un filtre séparé.
-- Recalage scan -> carte : avec GPS, seulement sur la carte des AUTRES drones (tous les 6 pas) ; sans GPS, en plus,
-  cap sur MA carte quand il est incertain (> 1,5° : en portant). Se recaler sur sa carte quand le modèle tient le cap
-  le dégradait (son orientation garde le biais de boussole du passé).
-- Blessés fixes (world.motion_class : estimation filtrée stable à 10 px près pendant 60 pas ; mobile au-delà de 20 px)
-  = amers sans GPS (position figée, celle des autres drones si dispo) ; affichés en carré bordeaux (mobiles : triangle
-  magenta) dans la vue debug. Non validé en partie réelle sans GPS (aucun drone dans la zone sur MapMedium01, 1500 pas).
-- Carte 1, 3 parties par config (erreur p50 / p95 / max, cap p50) : avec GPS 3,8 / 8,9 / 11,1, 1,8° (avant) ->
-  4,2 / 8,3 / 13,7, 0,9° ; phase sans GPS 12,1 / 27,2 / 31,3 (recalage seul) -> 8,4 / 17,0 / 19,3, cap p95 2,9°.
+Référence (recalage seul, sans modèle de mouvement) : 3,8 / 8,9 / 11,1 et 1,8° avec GPS ; 12,1 / 27,2 / 31,3 sans GPS.
+Le recalage sur blessés fixes n'est pas encore validé en partie réelle sans GPS (aucun drone dans la zone sur
+MapMedium01, 1500 pas).
 
-## Carte : murs effacés / épaissis (perception.py, scanmatch.py)
-Mesuré en rejouant les scans enregistrés avec la VRAIE pose : presque aucun mur effacé ; avec la pose estimée,
-3-20 % des cœurs de mur selon le drone. Cause principale : le CAP (biais boussole AR(1) ~4°, odomètre 1°/pas ; un
-drone garé voyait son cap osciller de ±7° et balayait les murs lointains).
-- `scanmatch.py` : recalage scan -> carte (champ d'occupation lissé, Gauss-Newton). Pose complète sur les murs des
-  AUTRES drones (indépendant) ; cap seul sur ma carte (plancher 1,5° si la boussole marche, sinon 0,7°).
-- Lidar : un rayon sans impact n'écrit pas de libre dans les 2 cellules avant la portée max (un mur vers 290-300 px
-  alternait mur / libre) ; libre arrêté à 1 cellule / sin(incidence) avant l'impact (rayons rasants) ; cellule
-  CERTAINE de ma couche (|log-odds| >= 12) contredite seulement par des rayons fiables (impact continu, incidence
-  franche, < 200 px) ; impacts > 250 px : poids 1.
-- Carte 1 (1 drone), cœurs effacés / faux murs : avec GPS 29 / 95 -> 11 / 39 ; sans GPS 9 / 52 -> 1 / 18.
-- Coût : le recalage tourne un pas sur deux (à surveiller sur les grandes cartes : limite de temps réel).
+## Carte d'occupation (`perception.py`, `gridmap.py`)
 
-## Partage de perceptions fusionnées
-Principe : chaque drone publie SA contribution déjà fusionnée (toutes ses observations, avec covariance), le receveur
-combine les contributions des différents drones par somme d'informations. On ne réémet jamais l'estimation globale :
-revenue par un autre chemin radio, elle serait comptée deux fois (filtre sûr de lui sans information nouvelle).
-Tous les drones qui ont reçu les mêmes contributions ont donc exactement la même estimation globale.
+### Structure
+Une couche de log-odds par drone (tuiles de 16 x 16 cellules de 8 px, saturée à ±20). Les couches de deux drones sont
+des preuves indépendantes : la vue fusionnée est leur **somme** (faite à la lecture, saturée à ±60 ; occupé ≥ 5,
+libre ≤ −3). On ne réémet jamais la somme (comptée deux fois en circulant en boucle) : chaque drone relaie les couches
+telles quelles. Une tuile de MA couche n'est republiée que si son contenu a changé (écart ≥ 4 log-odds ou changement
+de classe) : une zone saturée ne génère plus de trafic.
 
-- Objets (blessés, centre, coins) : une piste par drone et par objet = Kalman sur ses observations, plancher de
-  covariance = incertitude de sa pose (biais commun à ses observations). Publication seulement si utile (déplacement
-  > 1,5 px, covariance réduite de 20 %, changement d'état ; blessés : rafraîchis tous les 30 pas). L'estimation interne
-  s'affine entre deux publications. Lecture (`world.fuse_tracks`) : association par porte de Mahalanobis (99,9 %)
-  bornée par deux rayons par nature, ordre déterministe, fusion par somme d'informations, plus l'estimation
-  « tous sauf moi » (`others_pos/others_cov`).
-- Coins (`landmarks.py`) : créés avec la covariance de mesure propagée depuis la pose ; recalage de l'EKF sur
-  « global moins ma contribution » avec la covariance 2D complète (`update_landmark(cov_l=...)`) ; avec GPS aussi, sur
-  les coins vus par d'autres et convergés (σ < 3 px), délai 40 pas par coin ; plus de nouvelle contribution sur un coin
-  déjà convergé (σ < 2 px) : volume borné.
-- Carte : une couche par drone (preuves indépendantes, somme exacte). Une tuile n'est republiée que si son contenu a
-  changé (écart >= 4 log-odds ou changement de classe) ; on émet la version publiée (copies identiques partout) ;
-  tuiles uniformes envoyées sur 1 octet. Preuves pondérées par l'incertitude de pose (impact 3 / 2 / 1 selon σ).
-  Corps mobiles masqués du lidar : blessés et drones vus par le sémantique, plus les drones (position annoncée
-  extrapolée, porteurs élargis) et blessés connus jusqu'à 330 px ; impacts lidar déjà gravés sur un blessé connu
-  effacés de sa propre couche. Seuil d'impact à 300 − 3σ (le bruit s'applique aussi aux rayons sans impact).
-- Radio (`comms.py`) : vecteurs de versions par origine (2 x 16 entiers au lieu d'un tableau de révisions par tuile
-  et d'un dictionnaire par objet) ; plages (lo, hi] déclarées complètes, plafonnées à ce que l'émetteur connaît sans
-  trou ; plages reçues dans le désordre gardées en attente jusqu'à ce que le trou soit comblé ; objets envoyés dès
-  qu'ils changent (chaque pas), tuiles partagées équitablement entre origines. Anti-redondance : relais désigné par
-  voisin en retard et par origine (le mieux informé parmi ceux qu'il entend, puis le plus petit identifiant ; tout le
-  monde reprend après 8 pas sans progrès), plages entendues chez un voisin non renvoyées pendant le délai d'accusé
-  (5 pas : paquet construit à k, lu à k+2, résumé du voisin lu à k+4).
-  Vérifié hors simulateur : convergence exacte (6 drones, 30 % de pertes, topologie mobile).
+### Intégration d'un scan (`ScanIntegrator.integrate`)
+La cause principale des murs effacés ou épaissis est le **cap** (biais boussole ~4°, odomètre 1°/pas : à 250 px,
+5° = 22 px). Le recalage scan -> carte le corrige en amont ; l'intégration est en plus robuste à ce qui reste :
+- **Poids selon ma pose** : impact 3 / 2 / 1 selon σ (< 6, < 10 px), rien d'écrit au-delà de 14 px ; libre −1.
+  Ma couche porte ainsi l'incertitude de ma pose.
+- **Impact** seulement à plus de 3σ sous la portée max. Un rayon sans impact n'écrit du libre que jusqu'à 16 px avant
+  cette limite (un mur vers 290-300 px alterne impact / portée max).
+- **Marge avant l'impact** : le libre s'arrête à 1 cellule / sin(incidence) avant l'impact (max 60 px). Un rayon rasant
+  traverse la partie vide de la cellule du mur : un drone garé effacerait petit à petit un mur vu en rasant.
+- **Cellules certaines** (|log-odds| ≥ 12 dans ma couche) : contredites seulement par des **rayons fiables** (impact
+  continu avec ses voisins, < 200 px, et incidence franche pour le libre). Un rayon peut « glisser » entre deux pixels
+  de mur en incidence rasante : il n'efface plus un mur établi.
+- **Impacts lointains** (> 250 px) : poids 1 (décalage latéral dû au cap).
+- **Corps mobiles masqués** (ni impact, ni libre au-delà) : blessés et drones vus par le sémantique, et corps connus
+  jusqu'à 330 px (portée lidar > portée sémantique) : autres drones à leur position annoncée extrapolée (porteurs
+  élargis de leur blessé), blessés connus. Les impacts gravés sur un blessé avant qu'il soit reconnu sont effacés de ma
+  couche (`brain._clear_phantoms`).
 
-À faire :
-1. Localisation coopérative : détection sémantique des autres drones -> mesure de position pour eux
-   (intersection de covariances, surtout sans GPS ; `AgentState.pos_sigma` est déjà publié).
-2. Comms : priorité des tuiles selon leur utilité (frontières, routes), résumé d'une pièce explorée.
-3. Sous-réseaux : 2-3 groupes entiers, chacun connexe (aujourd'hui : excursions de binômes hors réseau).
-4. Routes de rapatriement partagées, puis retour du passage de relais (`handoff_enabled`).
+### Résultats (carte 1, 1 drone, rejeu des scans ; cœurs de mur effacés / faux murs)
+Avec la vraie pose, presque aucun mur effacé. Avec la pose estimée : avec GPS 11 / 39 (référence sans ces règles :
+29 / 95) ; sans GPS 1 / 18 (référence : 9 / 52). Coût : le recalage tourne un pas sur deux (à surveiller sur les
+grandes cartes : limite de temps réel).
+
+## Objets et blessés (`world.py`, `perception.observe_semantic`, `brain.py`)
+
+### Pistes et fusion
+- Chaque drone tient **une piste par objet** (blessé, centre de secours, coin, zone de retour) : Kalman sur toutes ses
+  observations, plancher de covariance = incertitude de sa pose (biais commun, il ne se moyenne pas).
+- Mesure sémantique : rayons voisins regroupés à 25 px, centre = surface + rayon − biais, covariance propagée depuis la
+  pose (relèvement : moyenne circulaire, σ / √n). Centre de secours : objet étendu, incertitude large.
+- **Publication seulement si utile** : déplacement > 1,5 px, covariance réduite de 20 %, changement d'état ; blessés
+  republiés tous les 30 pas. L'estimation interne s'affine entre deux publications.
+- **Lecture** (`world.fuse_tracks`) : association par porte de Mahalanobis (99,9 %) bornée par deux rayons par nature
+  (blessé : toujours le même sous 20 px, jamais au-delà de 45), ordre déterministe, fusion par somme d'informations,
+  plus l'estimation « tous sauf moi » (`others_pos / others_cov`) pour les recalages. Tous les drones qui ont reçu
+  les mêmes pistes ont exactement les mêmes objets.
+
+### Blessés mobiles et classe fixe / mobile
+- **Bruit de processus** sur les pistes de blessés (4 px² par pas, borné à 100 pas) : certains blessés se déplacent
+  (~2 px/pas). Sans lui, une piste devenue très sûre ne s'associe plus à un blessé qui a bougé de 20 px : nouvelle
+  piste, et l'ancienne reste « vue » à un endroit vide.
+- **Classe** (`world.motion_class`, par piste, d'après MES observations) : ancre = estimation filtrée après 5
+  observations (une mesure brute peut être fausse de 13 px) ; **fixe** si l'estimation reste à moins de 10 px de
+  l'ancre pendant 60 pas ; **mobile** dès 20 px (définitif) ; sinon non classé. Pour un objet fusionné
+  (`wounded_class`) : mobile si l'une de mes pistes du groupe l'est.
+- **Blessé fixe = amer sans GPS** : sa position n'est plus réestimée (elle suivrait la dérive de ma pose) et l'EKF se
+  recale dessus (cf. tableau des sources).
+- Vue debug : carré bordeaux = fixe, triangle magenta = mobile, rond rouge = non classé, orange = porté.
+
+### Blessés imaginaires, partis ou déjà pris
+- **Contrôle négatif** (`brain._check_vanished`, un pas sur deux) : un blessé connu à moins de 110 px, que le
+  sémantique ne voit pas, et dont tous les rayons lidar couvrant le disque (incertitudes comprises) passent plus loin
+  que lui. S'il était là, son corps arrêterait au moins un rayon (un drone ou un mur devant l'arrête aussi : pas de
+  conclusion). Après 4 constats consécutifs : `world.mark_gone`.
+- **`mark_gone`** : mes pistes du groupe passent à TAKEN ; une **pierre tombale** TAKEN plus récente masque celles des
+  autres drones (que je ne peux pas modifier). Une observation plus récente fait réapparaître le blessé.
+- **Saisie** : la piste est prise au point de saisie (25 px dans la direction du blessé), une pierre tombale « pris
+  ici » efface sa position, la piste passe à CARRIED et suit le porteur (tous les 15 pas). Les autres blessés connus à
+  moins de 80 px et non vus sont des doublons du blessé saisi (piste d'un blessé mobile, positions décalées d'autres
+  drones) : retirés.
+- **Dépose** : verdict après 20 pas ; un blessé encore visible n'est pas sauvé. Dépose volontaire devant une porte :
+  la piste est replacée là et redevient libre.
+- **Missions** : un GOTO dont la cible n'a plus de blessé à moins de 50 px est réaffecté ; arrivé sur place sans rien
+  voir pendant 25 pas : blessés proches oubliés et cible bannie 600 pas ; fin de route loin de la cible (injoignable) :
+  bannie 300 pas sans l'effacer. Une DROP dont le blessé à prendre n'existe plus est abandonnée.
+
+## Radio (`comms.py`)
+Vecteurs de versions par origine (2 x 16 entiers au lieu d'un tableau de révisions par tuile et d'un dictionnaire par
+objet) ; plages (lo, hi] déclarées complètes, plafonnées à ce que l'émetteur connaît sans trou ; plages reçues dans le
+désordre gardées en attente jusqu'à ce que le trou soit comblé ; objets envoyés dès qu'ils changent (chaque pas),
+tuiles partagées équitablement entre origines ; tuiles uniformes sur 1 octet. Anti-redondance : relais désigné par
+voisin en retard et par origine (le mieux informé parmi ceux qu'il entend, puis le plus petit identifiant ; tout le
+monde reprend après 8 pas sans progrès), plages entendues chez un voisin non renvoyées pendant le délai d'accusé
+(5 pas : paquet construit à k, lu à k+2, résumé du voisin lu à k+4).
+Vérifié hors simulateur : convergence exacte (6 drones, 30 % de pertes, topologie mobile).
 
 ## Carte topologique (topo.py) et planification
 Méthode « deux échelles » du prototype segproto.py :
@@ -195,3 +242,50 @@ Contrepartie : réseau moins connexe (5 drones par réseau au lieu de 8) ; `lane
 Avec la dépose à la porte (déclenchée quand le meneur quitte la pièce) : finale 1500 pas : exploration 49 % (68 % sans
 dépose, 38 % ancien code), trajets vers des blessés x6 (blessés déposés + 1/3 des drones libres réservés aux blessés),
 toujours 4/19 sauvés. Un seul essai par configuration : à confirmer sur plusieurs graines et sur une partie complète.
+
+## Monitoring d'une exécution
+
+Le monitoring est désactivé par défaut. Pour enregistrer chaque drone sans modifier le
+launcher, définir `SWARM_MONITOR` et utiliser son mode headless existant :
+
+    $env:SWARM_DEBUG = "0"
+    $env:SWARM_MONITOR = "monitor\map_medium_02.jsonl"
+    & .\.venv\Scripts\python.exe .\src\swarm_rescue\launcher.py --config .\config\my_eval_plan.yml --headless
+
+Le fichier JSONL contient, par drone et par pas, la mission, sa source, l'âge des
+informations de blessés, les voisins réellement entendus, les compteurs gossip, l'état
+de l'exploration et les anomalies détectées (`rescuer-on-stale-info`,
+`stale-agent-info`, `role-oscillation`). Pour afficher la trace ou l'exporter en CSV :
+
+    & .\.venv\Scripts\python.exe -m swarm_rescue.solutions.swarm.monitoring monitor\map_medium_02.jsonl --tail 40
+    & .\.venv\Scripts\python.exe -m swarm_rescue.solutions.swarm.monitoring monitor\map_medium_02.jsonl --csv monitor\map_medium_02.csv
+
+
+## Résultats sur le mini-simulateur (`tests/tools/toysim.py`, mêmes modèles de bruit)
+- 3 drones, 3000 pas : 4 blessés sur 6 sauvés, 0 collision, ~2 ms de calcul par pas et par drone.
+- Radio coupée 1500 pas puis rétablie : les cartes (42-54 %) convergent vers l'union (~75 %).
+- Murs de la carte : aucune cellule à plus d'une cellule d'un vrai mur.
+- Recalage sur coins : 15 px d'erreur -> ~2 px en 400 pas, GPS coupé (test unitaire `test_landmarks.py`).
+Les chiffres de précision de pose à jour sont ceux du rejeu sur le vrai simulateur (section Estimation de pose).
+
+## À vérifier sur le vrai simulateur
+1. `drone.py::_kind` : noms des types d'entité du capteur sémantique.
+2. Géométrie du centre de secours et condition de sauvetage : `release_dist`, `grasp_dist` dans `config.py`.
+3. Identifiant du drone : supposé dans 0..15 (`MAX_ORIGINS`).
+4. Recalage sur blessés fixes sans GPS : pas encore observé en partie réelle.
+
+## Limites connues
+- Non codé : zones de destruction / sans radio (les indices `DANGER_HINT`, `NOCOM_HINT` existent dans le schéma ;
+  `extra_cost` de `PlanGrid` permet de les éviter ; `communicator_is_disabled()` n'est pas lu), mission `RELAY`
+  (drone central messager).
+- La porte d'association ENTRE drones (`fuse_tracks`) ne vieillit pas les pistes de blessés (pas d'instant courant à
+  la lecture) : le bruit de processus ne s'applique qu'à mes propres pistes.
+- La classe fixe / mobile d'un blessé est locale (non transmise) : chaque drone la construit sur ses observations.
+- Un drone mort ou muet reste compté dans l'équipe 100 pas (allocation), 400 (porteur), 600 (surcoût de route).
+
+## À faire
+1. Localisation coopérative : détection sémantique des autres drones -> mesure de position pour eux
+   (intersection de covariances, surtout sans GPS ; `AgentState.pos_sigma` est déjà publié).
+2. Comms : priorité des tuiles selon leur utilité (frontières, routes), résumé d'une pièce explorée.
+3. Sous-réseaux : 2-3 groupes entiers, chacun connexe (aujourd'hui : excursions de binômes hors réseau).
+4. Routes de rapatriement partagées, puis retour du passage de relais (`handoff_enabled`).

@@ -22,12 +22,19 @@ def _wrap(a):
 class ScanIntegrator:
     """Lancer de rayons lidar -> preuves libre/occupé dans MA couche de carte.
 
+    Le scan est intégré APRÈS le recalage scan -> carte (scanmatch.py, appelé par brain.py). L'erreur de cap qui
+    reste (biais boussole, odomètre) est la principale cause de murs effacés ou épaissis ; d'où les règles :
     - une seule preuve "libre" par cellule et par scan, une seule "occupé" par cellule et par scan ;
-    - la cellule touchée n'est jamais marquée libre par un rayon rasant ;
-    - bruit réel du lidar (σ = 2,5 px, appliqué AUSSI aux rayons sans impact : 300 + bruit) : un rayon n'est un
-      impact que s'il est à plus de 3σ sous la portée max (sinon il peut s'agir d'un lidar arrivé en portée max) ;
     - poids des preuves selon l'incertitude de MA pose : un impact vaut ev_hit si la pose est sûre, moins si elle
       dérive (la couche porte ainsi l'incertitude de la carte) ; rien n'est écrit au-delà de max_pose_sigma ;
+    - bruit réel du lidar (σ = 2,5 px, appliqué AUSSI aux rayons sans impact : 300 + bruit) : un rayon n'est un
+      impact que s'il est à plus de 3σ sous la portée max ; un rayon sans impact n'écrit du libre que jusqu'à
+      map_far_buffer avant cette limite (un mur vers 290-300 px alterne impact / portée max) ;
+    - le libre s'arrête avant l'impact d'une marge map_margin_cell / sin(incidence) (cf. _free_margin) : un rayon
+      rasant ne traverse pas la cellule du mur ;
+    - cellules CERTAINES de ma couche (|log-odds| >= map_lock) : seuls des rayons fiables (impact continu, portée
+      < map_rel_range, incidence franche pour le libre) les contredisent ;
+    - impacts au-delà de map_far_hit : poids 1 (décalage latéral dû au cap) ;
     - rayons masqués (blessés, autres drones, porteurs) : ni impact ni preuve libre au-delà de l'objet.
     """
 

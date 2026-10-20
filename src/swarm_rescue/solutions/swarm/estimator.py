@@ -19,6 +19,13 @@ Modèle de mouvement (mesuré sur le vrai simulateur, MapIntermediate01, 1200 pa
 Mises à jour possibles (toutes optionnelles, appelables dans n'importe quel ordre) :
   update_gps, update_compass, update_landmark (distance + relèvement vers un point connu du monde),
   update_pose / update_heading (recalage scan -> carte, cf. scanmatch.py).
+
+Qui appelle quoi (règles dans brain.py, landmarks.py) : on ne se recale jamais sur ses propres observations quand
+la pose est bonne (elles partagent son erreur), seulement sur de l'information indépendante :
+  - coins de mur : estimation de l'essaim moins la mienne ; avec GPS, seulement sur des coins convergés vus par d'autres ;
+  - murs des autres drones : pose complète (avec ou sans GPS) ;
+  - ma carte : cap seul, sans GPS et quand le cap est vraiment incertain (en portant) ;
+  - blessés fixes (sans GPS) : position des autres drones, sinon la mienne figée depuis qu'il est classé fixe.
 """
 from __future__ import annotations
 

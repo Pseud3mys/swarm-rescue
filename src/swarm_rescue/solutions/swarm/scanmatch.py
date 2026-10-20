@@ -10,13 +10,18 @@ Gauss-Newton amorti sur (x, y, cap) pour amener les impacts lidar au centre des 
 cellules « occupé » seuillées avait un plateau : les couches des drones, légèrement décalées, donnent des murs épais de
 2-3 cellules où tout décalage est équivalent (8-12 px de jeu).
 
-Deux références (même principe que les coins, cf. landmarks.py) :
-  - murs des AUTRES drones seulement -> pose complète : information indépendante (les biais GPS / boussole des
-    drones et des instants différents s'y moyennent : gain avec le nombre de drones) ;
-  - carte complète, ma couche comprise -> cap seul : se recaler en position sur ses propres scans récents
-    s'auto-confirme et fait glisser la pose ; le cap, lui, ne fait plus de marche aléatoire (boussole coupée) et ne
-    suit plus les variations du biais de la boussole (un drone garé voyait son cap osciller de ±7° et balayait les
-    murs lointains jusqu'à les effacer). Boussole présente : plancher plus large, elle garde la main sur le long terme.
+Deux références (même principe que les coins, cf. landmarks.py), choisies par brain.py :
+  - murs des AUTRES drones seulement -> pose complète, tous les sm_pose_period pas, avec ou sans GPS : information
+    indépendante (les biais GPS / boussole des drones et des instants différents s'y moyennent : gain avec le nombre
+    de drones) ;
+  - carte complète, ma couche comprise -> cap seul, et seulement sans GPS quand le cap est vraiment incertain
+    (σθ > sm_own_min_sth : en portant, odomètre seul). Jamais en position : se recaler sur ses propres scans récents
+    s'auto-confirme et fait glisser la pose. Pas non plus quand le modèle de mouvement tient le cap (~0,1°/pas) :
+    l'orientation de ma carte garde le biais de boussole de mon passé et le recalage dégradait le cap (mesuré).
+    Boussole présente : plancher sm_own_floor_th, elle garde la main sur le long terme.
+
+Mesure renvoyée : covariance = variance des résidus x H^-1, gonflée (points corrélés) et avec planchers ; une
+direction dégénérée (couloir) reçoit une grande variance et l'EKF n'y corrige presque rien.
 """
 from __future__ import annotations
 
