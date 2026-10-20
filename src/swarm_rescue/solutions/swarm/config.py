@@ -63,7 +63,7 @@ class Params:
     inflate_cells_tight: int = 1       # repli si le but est injoignable
     unknown_cost: float = 2.5          # coût d'un pas en terrain inconnu (planification optimiste)
     frontier_min_cells: int = 3
-    replan_period: int = 45
+    replan_period: int = 30          # l'allocation doit suivre les cartes et objets gossipés, pas seulement les blocages
     switch_gain: float = 0.75          # une nouvelle cible doit coûter < 75 % de l'actuelle pour la remplacer
 
     # ---- contrôle ---------------------------------------------------------------------------------
@@ -115,6 +115,8 @@ class Params:
     lane_share: float = 0.5            # part des drones libres d'un réseau qui mènent une voie d'exploration (le reste :
                                        # relais nécessaires, suiveurs, blessés, base ; les drones en trop explorent aussi)
     drop_offset: float = 40.0          # px : dépose du blessé derrière la porte, côté pièce parente
+    small_net: int = 3                 # réseau de moins de N drones libres (isolé, binôme) ...
+    small_net_wounded_cost: float = 50.0   # ... : il ne quitte sa voie que pour un blessé à moins de ce coût (~400 px)
 
     # ---- missions ----------------------------------------------------------------------------------
     grasp_dist: float = 32.0
@@ -139,3 +141,7 @@ class Params:
     handoff_timeout: int = 200         # pas : passage de relais abandonné au-delà
     recover_steps: int = 30            # durée de la manœuvre de dégagement après un blocage
     drop_check_steps: int = 20         # après une dépose, un blessé encore visible n'est PAS sauvé
+    # ---- blessés imaginaires (pistes périmées, blessés mobiles) ---------------------------------------
+    vanish_check_dist: float = 110.0   # px : un blessé connu plus près que ça, en vue directe (lidar) et absent ...
+    vanish_checks: int = 4             # ... à N contrôles consécutifs (un pas sur deux) est retiré de la carte
+    grasp_clear_radius: float = 80.0   # px : à la saisie, les blessés connus non vus autour du saisi sont des doublons

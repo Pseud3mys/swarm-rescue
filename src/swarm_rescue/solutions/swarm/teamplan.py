@@ -163,7 +163,13 @@ class TeamPlanner:
                 continue
             rid = topo.region_at(pos, search=3)
             reg = topo.regions.get(rid)
-            if reg is None or reg.kind == CORRIDOR or reg.open or reg.parent < 0 or reg.link < 0:
+            if reg is None or reg.kind == CORRIDOR or reg.parent < 0 or reg.link < 0:
+                continue
+            # Une frontière peut encore exister dans la pièce alors que le meneur
+            # vise déjà une autre région. Dans ce cas le meneur doit prendre le
+            # blessé trouvé avant de quitter la pièce, plutôt que de laisser un
+            # suiveur le récupérer par le Hungarian.
+            if reg.open and (mis.target is None or topo.region_at(mis.target, search=3) == rid):
                 continue
             door = topo.links[reg.link].pos
             inroom = [(k, wp) for k, wp in enumerate(wounded) if k not in dropped
@@ -181,7 +187,15 @@ class TeamPlanner:
         fr = self._frontier_points(G, frontiers, dist_root, topo, outside)
         free_wounded = [wp for k, wp in enumerate(wounded) if k not in dropped]
         n_base = 1 if len(pool) >= 6 else 0
-        reserve_w = min(len(free_wounded), max(len(pool) // 3, 1)) if free_wounded else 0
+        # Petit réseau (drone isolé, binôme : souvent coupé du reste après une perte radio) : réserver un drone pour un
+        # blessé lui retirait sa voie d'exploration (k_lanes = 0 pour un drone seul) et l'envoyait sur un blessé connu
+        # par gossip, parfois à l'autre bout de la carte et déjà pris en charge par le réseau principal. On ne réserve
+        # que pour un blessé proche ; les autres restent aux drones sans voie (étape 5).
+        reserve_cand = free_wounded
+        if len(pool) < p.small_net and free_wounded:
+            reserve_cand = [wp for wp in free_wounded
+                            if min(PlanGrid.lookup(dm[i], G.cell(wp), radius=2) for i in pool) <= p.small_net_wounded_cost]
+        reserve_w = min(len(reserve_cand), max(len(pool) // 3, 1)) if reserve_cand else 0
         k_lanes = min(p.max_lanes, len(fr), max(1, math.ceil(p.lane_share * len(pool))),
                       max(len(pool) - n_base - reserve_w, 0))
         leaders = []                                         # (index agent, index frontière)

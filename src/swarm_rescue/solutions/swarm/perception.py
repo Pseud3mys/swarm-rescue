@@ -25,7 +25,7 @@ class ScanIntegrator:
     - une seule preuve "libre" par cellule et par scan, une seule "occupé" par cellule et par scan ;
     - la cellule touchée n'est jamais marquée libre par un rayon rasant ;
     - bruit réel du lidar (σ = 2,5 px, appliqué AUSSI aux rayons sans impact : 300 + bruit) : un rayon n'est un
-      impact que s'il est à plus de 3σ sous la portée max (sinon ~4 % de faux impacts à 300 px) ;
+      impact que s'il est à plus de 3σ sous la portée max (sinon il peut s'agir d'un lidar arrivé en portée max) ;
     - poids des preuves selon l'incertitude de MA pose : un impact vaut ev_hit si la pose est sûre, moins si elle
       dérive (la couche porte ainsi l'incertitude de la carte) ; rien n'est écrit au-delà de max_pose_sigma ;
     - rayons masqués (blessés, autres drones, porteurs) : ni impact ni preuve libre au-delà de l'objet.
@@ -38,7 +38,6 @@ class ScanIntegrator:
         m = world.map
         self._free = np.zeros((m.W, m.H), bool)
         self._hit = np.zeros((m.W, m.H), bool)
-        self.n_holes = 0          # stats : rayons « passés à travers un mur » corrigés
 
     def integrate(self, pose: Pose, ranges: np.ndarray, angles: np.ndarray,
                   ignore: Optional[np.ndarray] = None) -> int:
@@ -49,12 +48,12 @@ class ScanIntegrator:
             return 0
         r = np.asarray(ranges, float)
         ok = np.isfinite(r)
+        # Un rayon sans impact vaut 300 + bruit : seul un retour à plus de 3σ sous la portée max est un impact, et un
+        # rayon qui n'en est pas un n'écrit du libre que jusque-là (un mur réel vers 295 px ne doit pas être effacé).
         r_max = p.lidar_max_range - 3.0 * p.lidar_sigma
         hit = ok & (r < r_max) & (r > 3.0)
         if ignore is not None:
             hit &= ~ignore
-        r, hit, n_holes = fill_lidar_holes(r, hit, np.asarray(angles, float))
-        self.n_holes += n_holes
         a = pose.theta + np.asarray(angles, float)
         c, s = np.cos(a), np.sin(a)
         reach = np.where(ok, np.where(hit, r - 0.7 * m.res, r_max), 0.0)
@@ -79,48 +78,6 @@ class ScanIntegrator:
         m.add_evidence(self.w.me, np.r_[fx, hx], np.r_[fy, hy],
                        np.r_[np.full(fx.size, p.ev_free), np.full(hx.size, ev_hit)])
         return int(fx.size + hx.size)
-
-
-def fill_lidar_holes(r: np.ndarray, hit: np.ndarray, angles: np.ndarray, gap_max: float = 28.0,
-                     jump: float = 15.0) -> tuple:
-    """Rayons qui « passent à travers » un mur (le simulateur échantillonne une image : en incidence rasante et aux
-    jonctions de murs, un rayon peut glisser entre deux pixels de mur) : un ou deux rayons nettement plus longs que
-    leurs voisins, alors que ces voisins touchent deux points distants de moins de `gap_max` (trop étroit pour un
-    drone de toute façon). Sans correction, ils gravent un trou dans le mur : le planificateur croit pouvoir passer et
-    le drone longe le mur. Correction : impact sur le segment entre les deux voisins.
-    Renvoie (portées corrigées, impacts corrigés, nombre de rayons corrigés)."""
-    n = len(r) - 1                                    # le dernier rayon (+pi) double le premier (-pi)
-    if n < 4:
-        return r, hit, 0
-    r, hit = r.copy(), hit.copy()
-    rr, hh, aa = r[:n], hit[:n], angles[:n]
-    P = np.stack((rr * np.cos(aa), rr * np.sin(aa)), axis=1)
-    fixed = 0
-    for width in (1, 2):                              # trous d'un ou deux rayons
-        ia = (np.arange(n) - 1) % n
-        ib = (np.arange(n) + width) % n
-        gap = np.linalg.norm(P[ia] - P[ib], axis=1)
-        near = np.maximum(rr[ia], rr[ib])
-        cand = hh[ia] & hh[ib] & (gap < gap_max)
-        for k in range(width):
-            cand &= np.isfinite(rr[(np.arange(n) + k) % n]) & (rr[(np.arange(n) + k) % n] > near + jump)
-        for i in np.nonzero(cand)[0].tolist():
-            for k in range(width):
-                j = (i + k) % n
-                # intersection du rayon j avec le segment P[ia] -> P[ib] (mur supposé droit entre les deux impacts)
-                d = np.array((math.cos(aa[j]), math.sin(aa[j])))
-                A, B = P[ia[i]], P[ib[i]]
-                M = np.array([[d[0], A[0] - B[0]], [d[1], A[1] - B[1]]])
-                try:
-                    tt, _ = np.linalg.solve(M, A)
-                except np.linalg.LinAlgError:
-                    tt = 0.5 * (rr[ia[i]] + rr[ib[i]])
-                tt = float(np.clip(tt, min(rr[ia[i]], rr[ib[i]]) - 5.0, near[i] + 5.0))
-                rr[j], hh[j] = tt, True
-                P[j] = tt * d
-                fixed += 1
-    r[n], hit[n] = r[0], hit[0]
-    return r, hit, fixed
 
 
 def _mask_bodies(mask, ranges, angles, rel_bearing, dist, radius) -> np.ndarray:

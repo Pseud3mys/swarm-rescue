@@ -8,6 +8,7 @@ et les règles d'événements (quand replanifier, détection de blocage, saisie 
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections import deque
 from dataclasses import replace
@@ -27,6 +28,7 @@ from .perception import ScanIntegrator, dynamic_ray_mask, observe_semantic
 from .schema import Command, Mission, MissionKind, ObjKind, ObjState, Packet, Route, SensorFrame
 from .teamplan import TeamPlanner
 from .world import WorldModel
+from .monitoring import MissionMonitor
 
 
 class Brain:
@@ -35,6 +37,7 @@ class Brain:
         self.me = me
         self.world = WorldModel(me, size_area, p.resolution, p.chunk)
         self.gossip = Gossip(self.world, GossipConfig())
+        self.monitor = MissionMonitor(os.environ.get("SWARM_MONITOR"))
         self.ekf = PoseEKF(p)
         self.landmarks = LandmarkTracker(self.world, self.ekf, p, min_gap=30)
         self.scan = ScanIntegrator(self.world, p)
@@ -83,6 +86,7 @@ class Brain:
         self._last_explore = -10 ** 9
         self.mission_src = "start"
         self._no_follow: dict = {}      # meneur -> pas jusqu'auquel je ne le suis plus (un autre suiveur est mieux placé)
+        self._vanish: dict = {}         # blessé connu (clé de groupe) -> constats d'absence consécutifs
         self.timing = {"est": 0.0, "map": 0.0, "plan": 0.0, "ctl": 0.0, "n_plan": 0}
 
     # ------------------------------------------------------------------ interface
@@ -119,6 +123,8 @@ class Brain:
             mask = dynamic_ray_mask(f.lidar, f.angles, f.semantic, pose, self._bodies(t))
             self.scan.integrate(pose, f.lidar, f.angles, mask)
         seen = observe_semantic(w, pose, f.semantic, t, p)
+        if t % 2 == 1:
+            self._check_vanished(t, pose, f, seen)
         if t % 20 == 0:
             self._clear_phantoms()
         t2 = T()
@@ -127,14 +133,17 @@ class Brain:
         if f.carrying != self._was_carrying:
             self._plan_reason = "carry-change"
             if f.carrying:                                         # prise : la piste du blessé passe à CARRIED (sur place)
-                tr = w.nearest_own(ObjKind.WOUNDED, pose.pos, 80.0)
+                self._carry_bearing = self._wounded_bearing if self._wounded_bearing is not None else math.pi
+                a = pose.theta + self._carry_bearing
+                gp = pose.pos + 25.0 * np.array((math.cos(a), math.sin(a)))   # le blessé saisi est là
+                tr = w.nearest_own(ObjKind.WOUNDED, gp, 80.0)
                 if tr is None:
-                    tr = w.observe_object(ObjKind.WOUNDED, pose.pos, t, ObjState.SEEN)
+                    tr = w.observe_object(ObjKind.WOUNDED, gp, t, ObjState.SEEN)
                 w.add_track(ObjKind.WOUNDED, tr.pos, t, ObjState.TAKEN, tr.cov)   # "pris ici" : efface sa position
                 self._carry_key = tr.key
                 self._carry_since = t
-                self._carry_bearing = self._wounded_bearing if self._wounded_bearing is not None else math.pi
                 w.set_state(tr.key, ObjState.CARRIED, t)
+                self._clear_around_grasp(t, gp, seen)
             elif self._handoff_release:                            # passé à un autre drone : sa piste prend le relais
                 self._handoff_release = False
                 self._carry_key = None
@@ -175,6 +184,7 @@ class Brain:
         w.publish_self(t, pose.pos, pose.vel, f.health, self.mission,
                        self.route.waypoints() if self.route is not None else (), self.gossip.heard, pose.sigma)
         self._packet = self.gossip.build_packet(t)
+        self.monitor.observe(self, t)
         for k, a, b in (("est", t0, t1), ("map", t1, t2), ("plan", t2, t3), ("ctl", t3, t4)):
             self.timing[k] += b - a
         return cmd
@@ -215,6 +225,66 @@ class Brain:
             inside = gx ** 2 + gy ** 2 <= r * r
             ix, iy = m.world_to_cell(np.stack((o.pos[0] + gx[inside], o.pos[1] + gy[inside]), axis=1))
             m.clamp_max(self.me, ix, iy, 0)
+
+    # ------------------------------------------------------------------ blessés imaginaires
+    def _wounded_near(self, xy, radius: float) -> bool:
+        """Un blessé libre connu est-il encore à moins de `radius` de xy ?"""
+        xy = np.asarray(xy, float)
+        return any(o.state == ObjState.SEEN and np.linalg.norm(np.array(o.pos) - xy) < radius
+                   for o in self.world.objects_view(ObjKind.WOUNDED))
+
+    def _forget_wounded_near(self, xy, radius: float, t: int, seen=None) -> None:
+        """Retire les blessés libres connus à moins de `radius` de xy, sauf ceux que je vois en ce moment."""
+        xy = np.asarray(xy, float)
+        vis = [q for q, _, st in seen["wounded"] if st == ObjState.SEEN] if seen is not None else []
+        for o in list(self.world.objects_view(ObjKind.WOUNDED)):
+            if o.state != ObjState.SEEN or np.linalg.norm(np.array(o.pos) - xy) >= radius:
+                continue
+            if any(np.linalg.norm(q - np.array(o.pos)) < 40.0 for q in vis):
+                continue
+            self.world.mark_gone(o, t)
+
+    def _clear_around_grasp(self, t, gp, seen) -> None:
+        """Juste après une saisie : les autres blessés « connus » autour du blessé saisi et que je ne vois pas sont des
+        doublons de celui-ci (blessé mobile suivi en plusieurs pistes, positions d'autres drones décalées)."""
+        self._forget_wounded_near(gp, self.p.grasp_clear_radius, t, seen)
+
+    def _check_vanished(self, t, pose, f, seen) -> None:
+        """Vérification négative : un blessé connu, proche et en vue directe, qui n'est plus là. Tous les rayons lidar
+        qui couvrent son disque (incertitudes comprises) vont plus loin que lui, et le capteur sémantique ne voit aucun
+        blessé près de sa position : s'il y était, son corps arrêterait au moins un rayon (un drone ou un mur devant
+        l'arrête aussi : pas de conclusion). Après quelques constats consécutifs, la piste est retirée (blessé mobile
+        parti, blessé imaginaire, déjà pris par un autre)."""
+        if f.lidar is None or f.angles is None:
+            self._vanish = {}
+            return
+        p = self.p
+        r = np.asarray(f.lidar, float)
+        rel = np.asarray(f.angles, float) + pose.theta
+        vis = [q for q, _, _ in seen["wounded"]]
+        keep = {}
+        for o in self.world.objects_view(ObjKind.WOUNDED):
+            if o.state != ObjState.SEEN:
+                continue
+            op = np.array(o.pos)
+            to = op - pose.pos
+            d = float(np.linalg.norm(to))
+            rad = p.wounded_radius + 2.0 * (pose.sigma + o.sigma)
+            if d > p.vanish_check_dist or d < rad + 15.0:
+                continue
+            if any(np.linalg.norm(q - op) < 40.0 for q in vis):
+                continue
+            dev = (rel - math.atan2(to[1], to[0]) + np.pi) % (2 * np.pi) - np.pi
+            rays = np.abs(dev) < math.asin(rad / d) + 0.02
+            if rays.sum() < 2 or not (np.isfinite(r[rays]) & (r[rays] > d + rad)).all():
+                continue
+            k = o.sources[0]
+            n = self._vanish.get(k, 0) + 1
+            if n >= p.vanish_checks:
+                self.world.mark_gone(o, t)
+            else:
+                keep[k] = n
+        self._vanish = keep
 
     # ------------------------------------------------------------------ événements de replanification
     def _replan_reason(self, t, pose, f, seen) -> Optional[str]:
@@ -278,7 +348,12 @@ class Brain:
         route, chosen = None, None
         # porteur : le blessé dépasse du drone, on planifie avec plus de marge aux murs (repli si injoignable)
         inflates = (p.inflate_cells_carry, None, p.inflate_cells_tight) if f.carrying else (None, p.inflate_cells_tight)
-        # dépose en cours : on la termine (aller prendre le blessé, puis le porter devant la porte)
+        # dépose en cours : on la termine (aller prendre le blessé, puis le porter devant la porte), sauf si le blessé à
+        # prendre n'existe plus (blessé imaginaire, parti, pris par un autre) ou y a été abandonné : retour à l'équipe
+        if self.mission.kind == MissionKind.DROP and not f.carrying and self.mission.target is not None \
+                and (not self._wounded_near(self.mission.target, 50.0)
+                     or self.planner._banned(np.array(self.mission.target), t)):
+            self.mission = Mission(MissionKind.IDLE)
         if self.mission.kind == MissionKind.DROP and self.mission.dest is not None:
             goal = self.mission.dest if f.carrying else self.mission.target
             for k in inflates:
@@ -310,6 +385,13 @@ class Brain:
                     and team_mission.kind in (MissionKind.EXPLORE, MissionKind.GOTO_WOUNDED, MissionKind.DROP) \
                     and self.planner._banned(np.array(team_mission.target), t):
                 team_mission = None             # j'y ai déjà échoué : je laisse cette tâche (choix individuel)
+            if team_mission is not None and team_mission.kind == MissionKind.EXPLORE \
+                    and self.mission.kind == MissionKind.EXPLORE and self.mission.target is not None \
+                    and team_mission.target is not None and not self.planner._banned(np.array(self.mission.target), t) \
+                    and math.dist(team_mission.target, self.mission.target) < p.frontier_spacing:
+                # même voie : on garde le bord ouvert affiné par _refresh_explore (le plan d'équipe vise la cellule de
+                # la frontière la plus proche de la base ; les deux alternaient à chaque replanification)
+                team_mission = replace(team_mission, target=self.mission.target)
         for k in inflates:
             grid = PlanGrid(w, p, pose.pos, inflate=k, extra_cost=extra)
             grid.solve()
@@ -536,6 +618,7 @@ class Brain:
                   and a.mission.kind == MissionKind.EXPLORE and a.mission.target is not None]
         lane = np.array(self.mission.target) if self.mission.target is not None else None
         best, bc = None, float("inf")
+        cur, cc = None, float("inf")                          # meilleure frontière de ma voie actuelle
         for fx in fr:
             cxy = grid.m.cell_to_world(np.array([fx.cell[0]]), np.array([fx.cell[1]]))[0]
             if self.planner._banned(cxy, t):
@@ -547,10 +630,18 @@ class Brain:
                 c -= p.lane_sticky_bonus
             if any(np.linalg.norm(cxy - q) < p.frontier_spacing for q in others):
                 c += p.claim_penalty
+            if lane is not None and np.linalg.norm(cxy - lane) < p.lane_sticky_radius and c < cc:
+                cur, cc = cxy, c
             if c < bc:
                 best, bc = cxy, c
         if best is None:
             return
+        # La carte est fusionnée par gossip avec quelques pas de retard. Sans hystérésis ici, deux frontières presque
+        # équivalentes font repartir le meneur alternativement dans les deux directions. On garde la frontière ACTUELLE
+        # de sa voie (pas l'ancien point visé : arrivé dessus, il s'y arrêterait) ; marge relative valable aussi pour des
+        # coûts négatifs (bonus de voie et de taille).
+        if cur is not None and bc > cc - (1.0 - p.switch_gain) * abs(cc):
+            best = cur
         # on quitte une pièce finie qui contient encore un blessé : on le dépose d'abord devant la porte
         drop = self.team.drop_task(t, pose.pos, leaving_to=best)
         if drop is not None and not self.planner._banned(np.array(drop.target), t):
@@ -607,13 +698,20 @@ class Brain:
                     self._wounded_bearing = math.atan2(override_dir[1], override_dir[0]) - pose.theta
                     if d < p.grasp_close_dist:
                         self._grasp, self._grasp_since = 1, t
-            elif np.linalg.norm(tgt - pose.pos) < 35.0:
-                if self._arrived_t is None:
-                    self._arrived_t = t
-                elif t - self._arrived_t > 25 and t - self._sighting_t > 25:   # il n'est plus là
-                    self.world.observe_object(ObjKind.WOUNDED, tgt, t, ObjState.RESCUED)
-                    self.planner.ban(tgt, t + 600)
-                    self._plan_reason = "stuck"
+            elif t % 5 == 0 and not self._wounded_near(tgt, 50.0):
+                self._plan_reason = "stuck"                    # cible retirée (ou blessé mobile parti) : réaffectation
+            else:
+                close = np.linalg.norm(tgt - pose.pos) < 35.0
+                if close or (self.route is not None and self.follower.remaining(pose.pos) < 25.0):
+                    if self._arrived_t is None:
+                        self._arrived_t = t
+                    elif t - self._arrived_t > 25 and t - self._sighting_t > 25:
+                        if close:                              # sur place et rien en vue : il n'est plus là
+                            self._forget_wounded_near(tgt, 50.0, t, seen)
+                        # sinon fin de route loin de la cible (injoignable) : on y renonce, sans l'effacer
+                        self.planner.ban(tgt, t + (600 if close else 300))
+                        self._arrived_t = None
+                        self._plan_reason = "stuck"
             if self._grasp and not f.carrying and t - self._grasp_since > 40:
                 self._grasp = 0                                    # saisie ratée : on réessaie
 

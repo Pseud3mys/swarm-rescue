@@ -43,6 +43,11 @@ SMOOTH = {ObjKind.WOUNDED: 0.5, ObjKind.RESCUE_CENTER: 0.1, ObjKind.RETURN_AREA:
           ObjKind.CORNER: 0.2}
 # republication périodique d'une piste inchangée (pas) : seulement pour les objets dont l'état peut changer
 REFRESH = {ObjKind.WOUNDED: 30}
+# bruit de processus (px² par pas, marche aléatoire) : certains blessés se déplacent (~2 px/pas). Sans lui, la
+# covariance d'une piste tombe à quelques px² et un blessé qui a bougé de 20 px sort de la porte : nouvelle piste,
+# l'ancienne reste « vue » à un endroit vide (blessé imaginaire)
+PROCESS_Q = {ObjKind.WOUNDED: 4.0}
+PROCESS_DT_MAX = 100
 
 
 @dataclass(frozen=True)
@@ -204,10 +209,14 @@ class WorldModel:
         r0 = ASSOC[kind][0]
         mc = fusion.cov_pack(R) if R is not None else (r0 * r0, 0.0, r0 * r0)
         best, bm = None, float("inf")
+        q = PROCESS_Q.get(kind, 0.0)
         for tr in self.objects.values():
             if tr.origin == self.me and tr.kind == kind and tr.state not in (ObjState.TAKEN,):
                 own = self._own.get(tr.key)
                 p0, c0 = (own[0], fusion.cov_pack(own[1])) if own else (tr.pos, tr.cov)
+                if q > 0.0:
+                    dq = q * min(max(t - (own[2] if own else tr.t_seen), 0), PROCESS_DT_MAX)
+                    c0 = (c0[0] + dq, c0[1], c0[2] + dq)
                 ok, m2 = _same(kind, p0, c0, pos, mc)
                 if ok and m2 < bm:
                     best, bm = tr, m2
@@ -222,6 +231,8 @@ class WorldModel:
         own = self._own.get(best.key) or (np.array(best.pos), fusion.cov_unpack(best.cov), best.t_seen)
         new_state = ObjState.RESCUED if best.state == ObjState.RESCUED else state
         mu, P = own[0], own[1]
+        if q > 0.0 and state != ObjState.CARRIED:        # le blessé a pu bouger depuis la dernière mesure
+            P = P + q * min(max(t - own[2], 0), PROCESS_DT_MAX) * np.eye(2)
         if state == ObjState.CARRIED:                    # un blessé porté ne déplace pas sa piste ici
             pass
         elif R is not None:
@@ -247,6 +258,19 @@ class WorldModel:
         if tr.state == ObjState.RESCUED:
             return tr
         return self._publish(replace(tr, t_seen=t, state=state))
+
+    def mark_gone(self, obj: FusedObject, t: int) -> None:
+        """Objet fusionné vérifié absent de sa position (blessé imaginaire, blessé mobile parti, blessé déjà pris) :
+        mes pistes du groupe passent à TAKEN, et une pierre tombale TAKEN plus récente masque celles des autres drones
+        (que je ne peux pas modifier). Une observation plus récente le fait réapparaître."""
+        others = False
+        for key in obj.sources:
+            if key[0] == self.me:
+                self.set_state(key, ObjState.TAKEN, t)
+            else:
+                others = True
+        if others:
+            self.add_track(obj.kind, obj.pos, t, ObjState.TAKEN, obj.cov)
 
     def add_track(self, kind: ObjKind, pos, t: int, state: ObjState, cov=None) -> ObjectTrack:
         """Nouvelle piste à MOI, sans association (ex. pierre tombale "pris ici")."""

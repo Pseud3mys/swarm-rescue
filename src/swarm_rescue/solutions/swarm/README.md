@@ -23,6 +23,7 @@ Tests (sans le vrai simulateur) : `cd tests && PYTHONPATH=../solutions:. python3
 | `missions.py` | QUOI faire : porter, blessé libre, frontière, retour ; coordination par missions annoncées | coûts de `PlanGrid` | `Mission` |
 | `controller.py` | asservissement en vitesse, freinage, évitement | `Pose`, `Route`, lidar | `Command` |
 | `brain.py` | séquencement et événements (replanification, blocage, saisie/dépose) | tout | `Command`, `Packet` |
+| `monitoring.py` | télémétrie JSONL et détection d'informations radio périmées, changements de rôle et oscillations | `Brain` | journal JSONL |
 | `drone.py` | seul fichier qui touche au simulateur | `DroneAbstract` | |
 | `network.py` | image du réseau radio (liens entendus / prévus, composantes) | `WorldModel` | |
 | `teamplan.py` | allocation par réseau connexe : dépose, meneurs (le plus proche, en profondeur), relais derrière eux, suiveurs, blessés/base (hongrois) | `PlanGrid`, `WorldModel` | `Mission` par drone |
@@ -44,6 +45,23 @@ Un pas : radio → EKF (+ amers) → carte/objets → mission+chemin (sur évén
 - Radio coupée 1500 pas puis rétablie : les cartes (42-54 %) convergent vers l'union (~75 %).
 - Murs de la carte : aucune cellule à plus d'une cellule d'un vrai mur.
 
+## Monitoring d'une exécution
+
+Le monitoring est désactivé par défaut. Pour enregistrer chaque drone sans modifier le
+launcher, définir `SWARM_MONITOR` et utiliser son mode headless existant :
+
+    $env:SWARM_DEBUG = "0"
+    $env:SWARM_MONITOR = "monitor\map_medium_02.jsonl"
+    & .\.venv\Scripts\python.exe .\src\swarm_rescue\launcher.py --config .\config\my_eval_plan.yml --headless
+
+Le fichier JSONL contient, par drone et par pas, la mission, sa source, l'âge des
+informations de blessés, les voisins réellement entendus, les compteurs gossip, l'état
+de l'exploration et les anomalies détectées (`rescuer-on-stale-info`,
+`stale-agent-info`, `role-oscillation`). Pour afficher la trace ou l'exporter en CSV :
+
+    & .\.venv\Scripts\python.exe -m swarm_rescue.solutions.swarm.monitoring monitor\map_medium_02.jsonl --tail 40
+    & .\.venv\Scripts\python.exe -m swarm_rescue.solutions.swarm.monitoring monitor\map_medium_02.jsonl --csv monitor\map_medium_02.csv
+
 ## À vérifier sur le vrai simulateur (je n'ai pas pu l'exécuter)
 1. `drone.py::_kind` : noms des types d'entité du capteur sémantique.
 2. ~~Format de `received_messages`~~ : vérifié, `[(Communicator, message)]`, objets passés par référence (d'où l'immutabilité).
@@ -53,7 +71,11 @@ Un pas : radio → EKF (+ amers) → carte/objets → mission+chemin (sur évén
 6. ~~Bruit du lidar~~ : vérifié, σ = 2,5 px sur TOUS les rayons, y compris sans impact (300 + bruit) : seuil d'impact à 300 − 3σ.
 
 ## Limites connues
-- Non codé : zones de destruction / sans radio (les indices `DANGER_HINT`, `NOCOM_HINT` existent dans le schéma ; `extra_cost` de `PlanGrid` permet de les éviter ; `communicator_is_disabled()` n'est pas lu), mission `RELAY` (drone central messager), blessés mobiles.
+- Non codé : zones de destruction / sans radio (les indices `DANGER_HINT`, `NOCOM_HINT` existent dans le schéma ; `extra_cost` de `PlanGrid` permet de les éviter ; `communicator_is_disabled()` n'est pas lu), mission `RELAY` (drone central messager).
+- Blessés mobiles / imaginaires : bruit de processus sur les pistes de blessés (`world.PROCESS_Q`), contrôle négatif
+  (`brain._check_vanished` : blessé connu à < 110 px, en vue directe lidar, absent 4 fois de suite -> pierre tombale
+  TAKEN via `world.mark_gone`), doublons effacés à la saisie, DROP / GOTO abandonnés si la cible n'existe plus.
+  Non fait : la porte d'association ENTRE drones (`fuse_tracks`) ne vieillit pas les pistes (pas d'instant courant).
 - Un drone mort ou muet reste compté dans l'équipe 100 pas (allocation), 400 (porteur), 600 (surcoût de route).
 
 ## Partage de perceptions fusionnées
@@ -133,9 +155,10 @@ positions dans le réseau : 3 pas d'âge médian, 7-10 au 90e centile ; hors ré
 Grille d'équipe commune (depuis la base, sans surcoût autour des drones), pas de liste noire dans le plan (un drone
 qui a échoué sur une cible y renonce lui-même), topologie recalculée à `t // topo_period`.
 Exploration : un meneur recible toutes les 10 pas le bord ouvert le plus proche de lui (il suit l'ouvert au lieu de viser
-un point fixe) ; routes au milieu des couloirs et des portes (un raccourci ne s'approche pas plus des murs que ses
-extrémités). Lidar : un ou deux rayons qui « traversent » un mur entre deux impacts distants de < 28 px sont corrigés
-en impact (`perception.fill_lidar_holes`) : sinon un trou gravé dans le mur attirait la route le long du mur.
+un point fixe), avec hystérésis pour éviter les allers-retours dus au retard de fusion des cartes ; routes au milieu des
+couloirs et des portes (un raccourci ne s'approche pas plus des murs que ses extrémités). Lidar : les retours proches
+de la portée maximale sont rejetés à moins d'être au moins à 3σ sous la portée maximale ; le filtre de reconstruction
+des « faux trous » a été supprimé.
 Mesures (1 essai chacune) : MapMedium02 1000 pas : désaccord des créneaux meneur 24 -> 8 %, meneur le plus proche
 47 -> 75 %, temps d'exploration x2 ; finale 2024_25_02 1500 pas : exploration 38 -> 68 %, relais sur une route 22 -> 0 %.
 Contrepartie : réseau moins connexe (5 drones par réseau au lieu de 8) ; `lane_share` règle le compromis.

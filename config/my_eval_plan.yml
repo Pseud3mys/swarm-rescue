@@ -5,4 +5,4 @@ evaluation_plan:
   - map_name: MapMedium02
     nb_rounds: 1
     config_weight: 1
-    zones_config: []
+    zones_config: [NO_GPS_ZONE]
