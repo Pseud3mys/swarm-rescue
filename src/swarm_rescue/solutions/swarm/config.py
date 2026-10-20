@@ -44,9 +44,13 @@ class Params:
     rot_model_sigma: float = math.radians(0.12)        # rotation = commande x ang_per_cmd (résidu mesuré 0,07°)
     rot_model_sigma_carry: float = math.radians(2.0)   # en portant : couple du blessé (résidu mesuré 1,9°)
     rot_shock_deg: float = 4.0         # écart modèle / odomètre au-delà duquel on suit l'odomètre (choc)
-    vel_model_sigma: float = 0.08      # px/pas : vitesse = frottement + accel x commande (résidu mesuré 0,06)
-    vel_model_sigma_carry: float = 0.25
+    # vitesse = frottement + accel x commande : résidu mesuré 0,06 px/pas (odomètre 0,30), MAIS en rejouant l'EKF sur
+    # des parties enregistrées, faire confiance au modèle dégrade la POSITION (petit biais intégré ; en portant, le blessé
+    # traîné tire le drone de côté et corrompt le cap) : odomètre dominant. Le modèle sert à la vitesse du contrôle.
+    vel_model_sigma: float = 5.0
+    vel_model_sigma_carry: float = 5.0
     vel_model_sigma_blind: float = 0.4 # odomètre coupé
+    odo_th_coupling: bool = True       # la mesure odométrique corrige-t-elle aussi le cap (bruit d'angle 8° : non)
     shock_vel_var: float = 1.0         # px² : incertitude ajoutée à la vitesse quand l'odomètre contredit le modèle
 
     # ---- carte ------------------------------------------------------------------------------------
@@ -78,6 +82,7 @@ class Params:
     sm_floor_xy: float = 2.5           # px : plancher de la mesure (la carte des autres a sa propre erreur)
     sm_floor_th: float = 0.7           # deg
     sm_own_floor_th: float = 1.5       # deg : cap recalé sur MA carte alors que la boussole marche
+    sm_own_min_sth: float = 1.5        # deg : sans GPS, cap recalé sur MA carte seulement au-delà de cette incertitude
     # capteur sémantique (drone_semantic_sensor.py) : distance + N(2.5, 1) (biais +2,5 px, écart-type 1 :
     # np.random.normal(2.5) prend 2.5 comme MOYENNE), angle exact mais discrétisé (35 rayons, 10,3°) ;
     # la distance va jusqu'à la SURFACE du blessé (rayon 12)
@@ -178,4 +183,5 @@ class Params:
     # ---- blessés imaginaires (pistes périmées, blessés mobiles) ---------------------------------------
     vanish_check_dist: float = 110.0   # px : un blessé connu plus près que ça, en vue directe (lidar) et absent ...
     vanish_checks: int = 4             # ... à N contrôles consécutifs (un pas sur deux) est retiré de la carte
+    wounded_lm_gap: int = 10           # pas : sans GPS, recalage sur un même blessé fixe au plus tous les N pas
     grasp_clear_radius: float = 80.0   # px : à la saisie, les blessés connus non vus autour du saisi sont des doublons

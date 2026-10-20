@@ -19,6 +19,7 @@ import numpy as np
 from .comms import Gossip, GossipConfig, extract_packets
 from .config import Params
 from .controller import PathFollower
+from . import fusion
 from .estimator import PoseEKF
 from .gridmap import OCC_THR
 from .landmarks import LandmarkTracker
@@ -91,6 +92,7 @@ class Brain:
         self._last_explore = -10 ** 9
         self.mission_src = "start"
         self._no_follow: dict = {}      # meneur -> pas jusqu'auquel je ne le suis plus (un autre suiveur est mieux placé)
+        self._wl_last: dict = {}        # blessé fixe -> dernier recalage de l'EKF dessus
         self._vanish: dict = {}         # blessé connu (clé de groupe) -> constats d'absence consécutifs
         self.timing = {"est": 0.0, "map": 0.0, "plan": 0.0, "ctl": 0.0, "n_plan": 0}
 
@@ -127,19 +129,21 @@ class Brain:
             self._home_xy = pose.pos.copy()
         if f.lidar is not None and t % 2 == 0:       # un scan sur deux suffit (on bouge de < 5 px par pas)
             mask = dynamic_ray_mask(f.lidar, f.angles, f.semantic, pose, self._bodies(t))
-            # recalage sur la carte AVANT d'y graver ce scan. Avec GPS : l'EKF (modèle de mouvement + GPS + boussole)
-            # suffit, seul le recalage sur la carte des AUTRES drones apporte une information (tous les sm_pose_period
-            # pas : coût). Sans GPS : en plus, cap recalé sur ma carte à chaque scan (en portant, le couple du blessé
-            # rend le cap incertain : seule la carte le tient)
+            # recalage sur la carte AVANT d'y graver ce scan. Le modèle de mouvement de l'EKF tient le cap à ~0,1°/pas :
+            # se recaler sur SA carte (dont l'orientation garde le biais de boussole de son passé) le dégradait (mesuré).
+            # Seuls cas utiles : la carte des AUTRES drones (indépendante, tous les sm_pose_period pas : coût), et, sans
+            # GPS, ma carte quand le cap est vraiment incertain (en portant : odomètre seul, ~1°/pas)
             gps_mode = f.gps is not None
-            if p.sm_enabled and (not gps_mode or t % p.sm_pose_period == 0):
+            use_own = not gps_mode and math.sqrt(max(float(pose.cov[2, 2]), 0.0)) > math.radians(p.sm_own_min_sth)
+            if p.sm_enabled and (use_own or t % p.sm_pose_period == 0):
                 fix = self.matcher.match(t, pose, f.lidar, f.angles, mask, compass_ok=f.compass is not None,
-                                         want_pose=t % p.sm_pose_period == 0, use_own=not gps_mode)
+                                         want_pose=t % p.sm_pose_period == 0, use_own=use_own)
                 if fix is not None and (self.ekf.update_pose(fix[1], fix[2]) if fix[0] == "pose"
                                         else self.ekf.update_heading(fix[1], fix[2])):
                     pose = self.ekf.pose()
             self.scan.integrate(pose, f.lidar, f.angles, mask)
         seen = observe_semantic(w, pose, f.semantic, t, p)
+        self._wounded_landmarks(t, f, seen)
         if t % 2 == 1:
             self._check_vanished(t, pose, f, seen)
         if t % 20 == 0:
@@ -242,6 +246,32 @@ class Brain:
             inside = gx ** 2 + gy ** 2 <= r * r
             ix, iy = m.world_to_cell(np.stack((o.pos[0] + gx[inside], o.pos[1] + gy[inside]), axis=1))
             m.clamp_max(self.me, ix, iy, 0)
+
+    # ------------------------------------------------------------------ blessés fixes comme amers
+    def _wounded_landmarks(self, t, f, seen) -> None:
+        """Sans GPS : un blessé FIXE (vu longtemps sans bouger, cf. world.motion_class) est un amer comme un coin :
+        recalage de l'EKF sur la distance et le relèvement mesurés. Position de référence : celle des AUTRES drones
+        s'ils l'ont vu (indépendante), sinon la mienne, figée depuis qu'il est classé fixe (cf. observe_object)."""
+        p, w = self.p, self.world
+        if f.gps is not None or not seen["wounded_rb"]:
+            return
+        view = w.objects_view(ObjKind.WOUNDED)
+        for key, rng, brg, n in seen["wounded_rb"]:
+            if w.motion_class(key) != "fixed" or t - self._wl_last.get(key, -10 ** 9) < p.wounded_lm_gap:
+                continue
+            o = next((o for o in view if key in o.sources), None)
+            if o is None or o.state != ObjState.SEEN or w.wounded_class(o) != "fixed":
+                continue
+            if o.others_pos is not None:
+                ref, cov = o.others_pos, fusion.cov_unpack(o.others_cov)
+            else:
+                own = w._own.get(key)
+                if own is None:
+                    continue
+                ref, cov = own[0], own[1]
+            if self.ekf.update_landmark(ref, rng, brg, sigma_r=p.sem_sigma_r, sigma_b=p.sem_sigma_b / math.sqrt(n),
+                                        cov_l=cov):
+                self._wl_last[key] = t
 
     # ------------------------------------------------------------------ blessés imaginaires
     def _wounded_near(self, xy, radius: float) -> bool:

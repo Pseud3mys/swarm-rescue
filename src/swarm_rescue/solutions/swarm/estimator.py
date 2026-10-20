@@ -10,8 +10,10 @@ Modèle de mouvement (mesuré sur le vrai simulateur, MapIntermediate01, 1200 pa
     fusion des deux ; odomètre seul en cas de choc (écart > 4°) et en portant (le couple du blessé écarte la rotation
     du modèle de façon systématique : fusionner biaisait le cap de 30° sans boussole) ;
   - vitesse : v_k = drag v_{k-1} + accel R(th) commande : résidu 0,06 px/pas contre 0,30 px/pas pour l'odomètre ;
-    l'odomètre devient une MESURE de v (dans le repère du drone au pas précédent), les chocs sont détectés par
-    l'innovation (vitesse rendue incertaine, on suit l'odomètre).
+    l'odomètre est une MESURE de v (dans le repère du drone au pas précédent). Rejoué sur des parties enregistrées,
+    faire confiance au modèle dégrade pourtant la position (petit biais intégré ; en portant, le blessé traîné tire
+    le drone de côté et corrompt le cap) : vel_model_sigma est réglé large (odomètre dominant). La vitesse transmise
+    au contrôle vient d'un filtre séparé qui, lui, utilise le modèle.
   Sans GPS, c'est ce qui borne la dérive entre deux recalages (amers, carte).
 
 Mises à jour possibles (toutes optionnelles, appelables dans n'importe quel ordre) :
@@ -47,6 +49,8 @@ class PoseEKF:
         self.gps_ok = False
         self.compass_ok = False
         self._rejects = 0
+        self.v = np.zeros(2)            # vitesse pour le contrôle (filtre séparé : modèle + odomètre), px/pas
+        self.pv = 0.05
         self.stats = {"gps": 0, "gps_rej": 0, "landmark": 0, "landmark_rej": 0, "odo_shock": 0, "rot_shock": 0}
 
     # ------------------------------------------------------------------ initialisation
@@ -131,6 +135,23 @@ class PoseEKF:
         self.P = F @ self.P @ F.T + Q
         if odom_ok:
             self._update_odom(float(odom[0]), float(odom[1]), dth)
+        vm = None
+        if odom_ok:
+            phi = th_old + float(odom[1])
+            vm = float(odom[0]) * np.array((math.cos(phi), math.sin(phi)))
+        self._predict_velocity(a, vm)
+
+    def _predict_velocity(self, a, vm) -> None:
+        """Vitesse pour le contrôle : filtre scalaire (modèle d'accélération connu + mesure odométrique) ; 3x plus
+        précise que l'odomètre seul (mesuré), sans effet sur la position de l'EKF."""
+        p = self.p
+        self.v = p.drag * self.v + a
+        self.pv = self.pv * p.drag ** 2 + p.accel_model_trust ** 2
+        if vm is not None:
+            r = p.odom_sigma_dist ** 2 + (np.linalg.norm(vm) * p.odom_sigma_alpha) ** 2 + 1e-4
+            k = self.pv / (self.pv + r)
+            self.v = self.v + k * (vm - self.v)
+            self.pv = (1 - k) * self.pv
 
     def _update_odom(self, d: float, alpha: float, dth: float) -> None:
         """Odomètre = mesure du déplacement du pas, dans le repère du drone au pas précédent (cap = th - dth)."""
@@ -141,8 +162,10 @@ class PoseEKF:
         vx, vy = self.x[VX], self.x[VY]
         h = np.array((c * vx + s * vy, -s * vx + c * vy))
         H = np.zeros((2, N))
-        H[0, VX], H[0, VY], H[0, TH] = c, s, -s * vx + c * vy
-        H[1, VX], H[1, VY], H[1, TH] = -s, c, -c * vx - s * vy
+        H[0, VX], H[0, VY] = c, s
+        H[1, VX], H[1, VY] = -s, c
+        if p.odo_th_coupling:
+            H[0, TH], H[1, TH] = -s * vx + c * vy, -c * vx - s * vy
         J = np.array([[math.cos(alpha), -d * math.sin(alpha)], [math.sin(alpha), d * math.cos(alpha)]])
         R = J @ np.diag([p.odom_sigma_dist ** 2, p.odom_sigma_alpha ** 2]) @ J.T + 1e-4 * np.eye(2)
         m2, y, S, Sinv = self._update(z, h, H, R)
@@ -280,4 +303,4 @@ class PoseEKF:
     def pose(self) -> Pose:
         cov = self.P[:3, :3].copy()
         return Pose(float(self.x[PX]), float(self.x[PY]), wrap(float(self.x[TH])),
-                    float(self.x[VX]), float(self.x[VY]), cov, self.gps_ok)
+                    float(self.v[0]), float(self.v[1]), cov, self.gps_ok)

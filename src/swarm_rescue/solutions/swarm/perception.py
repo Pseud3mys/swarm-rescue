@@ -189,10 +189,10 @@ def observe_semantic(world: WorldModel, pose: Pose, semantic: Sequence, t: int,
     """Détections sémantiques -> pistes d'objets avec covariance. Renvoie ce qui est visible maintenant
     (pour les missions) : (position du centre, distance mesurée brute, état)."""
     p = params or Params()
-    seen = {"wounded": [], "rescue": []}
+    seen = {"wounded": [], "rescue": [], "wounded_rb": []}    # wounded_rb : (ma piste, distance, relèvement, nb rayons)
     pts = []
     for det in semantic:
-        if det.kind not in seen or not np.isfinite(det.distance):
+        if det.kind not in ("wounded", "rescue") or not np.isfinite(det.distance):
             continue
         ang = pose.theta + det.angle
         if det.kind == "wounded":            # surface vue -> centre du blessé, biais du capteur retiré
@@ -214,14 +214,18 @@ def observe_semantic(world: WorldModel, pose: Pose, semantic: Sequence, t: int,
         det, _, _ = min(items, key=lambda x: x[0].distance)
         pos = np.mean([q for _, q, _ in items], axis=0)       # rayons voisins : moyenne des centres
         reach = float(np.mean([r for _, _, r in items]))
-        bearing = float(np.mean([x.angle for x, _, _ in items]))
+        bearing = math.atan2(sum(math.sin(x.angle) for x, _, _ in items),    # moyenne circulaire (±pi)
+                             sum(math.cos(x.angle) for x, _, _ in items))
         if kind == "wounded":
             carried = any(x.grasped for x, _, _ in items)
             st = ObjState.CARRIED if carried else ObjState.SEEN
             if not carried:                    # un blessé porté par un autre : son porteur gère la piste
                 R = fusion.meas_point_cov(pose.cov, pose.theta, reach, bearing, p.sem_sigma_r,
                                           p.sem_sigma_b / math.sqrt(len(items)))
-                world.observe_object(ObjKind.WOUNDED, pos, t, st, cov=R, floor_var=floor)
+                # sans GPS, un blessé fixe garde sa position (amer) au lieu de suivre la dérive de ma pose
+                tr = world.observe_object(ObjKind.WOUNDED, pos, t, st, cov=R, floor_var=floor,
+                                          anchor_fixed=not pose.gps_ok)
+                seen["wounded_rb"].append((tr.key, reach, bearing, len(items)))
             seen["wounded"].append((pos, det.distance, st))
         elif kind == "rescue":
             # objet étendu (200 x 100 px) : chaque rayon voit un point différent du bord -> incertitude large

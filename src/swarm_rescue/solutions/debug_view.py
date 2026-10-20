@@ -39,6 +39,15 @@ _ROLE = {
 }
 _DEAD = (60, 60, 60)
 _W_COLOR = {ObjState.SEEN: (230, 30, 30), ObjState.CARRIED: (245, 140, 0)}
+# blessé libre selon sa classe de mouvement (world.motion_class) : fixe (amer sans GPS) / mobile / pas encore classé
+_W_CLASS = {"fixed": ((120, 0, 0), "s"), "moving": ((230, 0, 230), "t"), "unknown": ((230, 30, 30), "o")}
+
+
+def _wounded_spot(o, cls: str, brush) -> dict:
+    if o.state == ObjState.SEEN:
+        col, sym = _W_CLASS[cls]
+        return {"pos": o.pos, "brush": brush(col), "symbol": sym}
+    return {"pos": o.pos, "brush": brush(_W_COLOR[o.state]), "symbol": "o"}
 
 
 def _lut() -> np.ndarray:
@@ -181,6 +190,8 @@ class SwarmDebugView:
                            (_ROLE[k] for k in (MissionKind.EXPLORE, MissionKind.FOLLOW, MissionKind.RELAY,
                                                MissionKind.GOTO_WOUNDED, MissionKind.CARRY, MissionKind.RECEIVE)))
         legend += ("  &nbsp;|&nbsp; <b>O</b> vrai blessé &nbsp; <span style='color:rgb(230,30,30)'>&#9679;</span> blessé cru"
+                   " (<span style='color:rgb(120,0,0)'>&#9632;</span> fixe = amer,"
+                   " <span style='color:rgb(230,0,230)'>&#9650;</span> mobile)"
                    " &nbsp; &#9671; poste relais/base &nbsp; trait rouge = erreur de pose &nbsp; vert = lien radio"
                    " &nbsp;|&nbsp; <span style='color:rgb(230,50,50)'>&#9679;</span> passage/porte"
                    " <span style='background:rgb(255,160,60)'>couloir</span> pièces en pastel, arbre en bleu")
@@ -317,7 +328,9 @@ class SwarmDebugView:
         spots = []
         for o in fuse_tracks(list(merged.values())):
             if o.state in _W_COLOR:
-                spots.append({"pos": o.pos, "brush": self._brush(_W_COLOR[o.state]), "symbol": "o"})
+                cls = {d._brain.world.motion_class(k) for d in drones for k in o.sources if k[0] == d._brain.me}
+                c = "moving" if "moving" in cls else ("fixed" if "fixed" in cls else "unknown")
+                spots.append(_wounded_spot(o, c, self._brush))
         return spots
 
     @staticmethod
@@ -348,7 +361,7 @@ class SwarmDebugView:
         spots = []
         for o in w.objects_view():
             if o.kind == ObjKind.WOUNDED and o.state in _W_COLOR:
-                spots.append({"pos": o.pos, "brush": self._brush(_W_COLOR[o.state]), "symbol": "o"})
+                spots.append(_wounded_spot(o, w.wounded_class(o), self._brush))
             elif o.kind == ObjKind.RESCUE_CENTER:
                 spots.append({"pos": o.pos, "brush": self._brush((40, 90, 230)), "symbol": "s"})
         panel.objects.setData(spots)

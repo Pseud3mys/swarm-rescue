@@ -78,6 +78,23 @@ de l'exploration et les anomalies détectées (`rescuer-on-stale-info`,
   Non fait : la porte d'association ENTRE drones (`fuse_tracks`) ne vieillit pas les pistes (pas d'instant courant).
 - Un drone mort ou muet reste compté dans l'équipe 100 pas (allocation), 400 (porteur), 600 (surcoût de route).
 
+## Estimation de pose (estimator.py) : modèle de mouvement, modes avec / sans GPS
+Mesuré sur le vrai simulateur (MapIntermediate01) : rotation = commande x 0,176 rad à 0,07°/pas près (odomètre :
+1,0°/pas) ; vitesse = 0,95 v + 0,55 x commande à 0,06 px/pas près (odomètre : 0,30). EKF à 8 états (pose, vitesse,
+biais) ; tests par REJEU hors ligne de l'EKF sur des parties enregistrées (entrées capteurs + vérité).
+- Cap : incrément = fusion modèle + odomètre ; odomètre seul en cas de choc (> 4°) et EN PORTANT (le couple du blessé
+  écarte la rotation du modèle de façon systématique : 30° de biais sans boussole sinon).
+- Vitesse : le modèle améliore la vitesse (x3) mais PAS la position (petit biais intégré ; en portant, le blessé traîné
+  tire le drone de côté) : position à odomètre dominant, vitesse du contrôle par un filtre séparé.
+- Recalage scan -> carte : avec GPS, seulement sur la carte des AUTRES drones (tous les 6 pas) ; sans GPS, en plus,
+  cap sur MA carte quand il est incertain (> 1,5° : en portant). Se recaler sur sa carte quand le modèle tient le cap
+  le dégradait (son orientation garde le biais de boussole du passé).
+- Blessés fixes (world.motion_class : estimation filtrée stable à 10 px près pendant 60 pas ; mobile au-delà de 20 px)
+  = amers sans GPS (position figée, celle des autres drones si dispo) ; affichés en carré bordeaux (mobiles : triangle
+  magenta) dans la vue debug. Non validé en partie réelle sans GPS (aucun drone dans la zone sur MapMedium01, 1500 pas).
+- Carte 1, 3 parties par config (erreur p50 / p95 / max, cap p50) : avec GPS 3,8 / 8,9 / 11,1, 1,8° (avant) ->
+  4,2 / 8,3 / 13,7, 0,9° ; phase sans GPS 12,1 / 27,2 / 31,3 (recalage seul) -> 8,4 / 17,0 / 19,3, cap p95 2,9°.
+
 ## Carte : murs effacés / épaissis (perception.py, scanmatch.py)
 Mesuré en rejouant les scans enregistrés avec la VRAIE pose : presque aucun mur effacé ; avec la pose estimée,
 3-20 % des cœurs de mur selon le drone. Cause principale : le CAP (biais boussole AR(1) ~4°, odomètre 1°/pas ; un
