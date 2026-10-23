@@ -16,7 +16,7 @@ debug_export/
   positions.csv                                               t, drone, x, y, cap, mission, origine, cible, porte
 
 Image d'un drone (x vers la droite, y vers le haut) : blanc = libre, noir = mur, gris = inconnu, rouge = frontières,
-vert plein = vrais blessés, cercle magenta = blessés connus du drone (pâle : pris / sauvés), bleu = le drone et un trait
+vert plein = vrais blessés restants, cercle magenta = blessés libres connus du drone (violet foncé : portés), bleu = le drone et un trait
 vers sa cible, bleu clair = les autres drones (positions qu'il connaît).
 """
 from __future__ import annotations
@@ -74,9 +74,11 @@ def _render(b, truth: list):
 
     for tp in truth:
         cv2.circle(img, px(tp), 6, (0, 200, 0), -1)
-    known = list(b.world.objects_view(ObjKind.WOUNDED))
+    # seulement ce qui compte pour la planification : libres (magenta) et portés (violet). Les pistes « pris ici » et
+    # « sauvé » restent en mémoire (historique) mais encombraient l'image
+    known = [o for o in b.world.objects_view(ObjKind.WOUNDED) if o.state in (ObjState.SEEN, ObjState.CARRIED)]
     for o in known:
-        cv2.circle(img, px(o.pos), 9, (255, 0, 255) if o.state == ObjState.SEEN else (200, 150, 200), 2)
+        cv2.circle(img, px(o.pos), 9, (255, 0, 255) if o.state == ObjState.SEEN else (160, 60, 160), 2)
     for a in b.world.others():
         cv2.circle(img, px(a.pos), 4, (255, 200, 120), -1)
     if b.mission.target is not None:
@@ -88,6 +90,7 @@ def _render(b, truth: list):
     arrays = dict(view=v.copy(), frontiers=front,
                   pose=np.r_[pose.pos, pose.theta], res=m.res, half=m.half,
                   wounded_known=np.array([o.pos for o in known], float).reshape(-1, 2),
+                  wounded_known_state=np.array([int(o.state) for o in known], int),
                   wounded_truth=np.array(truth, float).reshape(-1, 2))
     return img, arrays
 
@@ -119,6 +122,8 @@ class Recorder:
         self._known: dict = {}           # drone -> nb de blessés connus (libres)
         self._brains: dict = {}
         self._sheet_t = -1
+        self.truth: list = []            # vrais blessés encore sur la carte (dernière lecture pendant le run)
+        self._truth_t = -1
 
     def _log(self, t, d, kind, msg, **data):
         self._events.write(json.dumps(dict(t=t, drone=d, event=kind, **data), default=float) + "\n")
@@ -126,6 +131,9 @@ class Recorder:
 
     def observe(self, b, t: int) -> None:
         self._brains[b.me] = b
+        if t != self._truth_t:                       # vrais blessés restants, une fois par pas (debug seulement)
+            self._truth_t = t
+            self.truth = _truth_from_playground(self.pg)
         pose = b.ekf.pose()
         tgt = b.mission.target
         role = (b.mission.kind.name, b.mission_src)
@@ -165,13 +173,13 @@ class Recorder:
 
     def _snapshot(self, b, t, tag) -> None:
         try:
-            img, _ = _render(b, _truth_from_playground(self.pg))
+            img, _ = _render(b, self.truth)
             cv2.imwrite(os.path.join(self.root, "snapshots", f"t{t:05d}_d{b.me}_{tag}.png"), img)
         except Exception as e:
             print(f"debug_export : instantané drone {b.me} : {e}")
 
     def _write_sheet(self, path) -> None:
-        truth = _truth_from_playground(self.pg)
+        truth = self.truth
         ims = []
         for d in sorted(self._brains):
             try:
@@ -214,8 +222,9 @@ def dump_maps(the_map, root: str = ROOT) -> str | None:
     if _REC is None or _REC.root != root:
         shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out, exist_ok=True)
-    truth = _truth_from_playground(the_map.playground) \
-        or [np.array(p, float) for p in getattr(the_map, "_wounded_persons_pos", [])]
+    # En fin de run la scène est déjà vidée (v6) : on prend la dernière lecture faite pendant le run. Sans elle,
+    # l'ancien repli sur les positions INITIALES montrait des blessés déjà sauvés comme encore en place.
+    truth = _REC.truth if _REC is not None and _REC.pg is the_map.playground else _truth_from_playground(the_map.playground)
     ims = []
     for b in brains:
         try:

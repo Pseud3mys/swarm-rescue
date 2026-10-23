@@ -125,6 +125,9 @@ class SwarmDebugView:
     def __init__(self, period: int = 1):
         self.period = max(int(period), 1)
         self._key = None
+        self._retired = set()
+        self._retired_refs = []
+        self._group = None
         self._win = None
         self._app = None
         self._big: Optional[_Panel] = None
@@ -215,12 +218,19 @@ class SwarmDebugView:
 
     # ------------------------------------------------------------------ mise à jour
     def update(self, drones, t: int) -> None:
+        key = tuple(id(d) for d in drones)
+        if key in self._retired:                  # ancien round dont le GUI appelle encore display() : on ignore
+            return
         drones = [d for d in drones if getattr(d, "_brain", None) is not None]
         if not drones:
             return
-        key = tuple(id(d) for d in drones)
         if key != self._key:                      # nouveau round (nouvelles instances) : on reconstruit
+            if self._key is not None:
+                self._retired.add(self._key)
+                self._retired_refs.append(self._group)   # garde les anciens drones en vie : sinon leurs id() peuvent
+                                                         # être réutilisés par le round suivant et le faire ignorer
             self._key = key
+            self._group = list(drones)
             self._build(drones)
         if t % self.period == 0 and self._win.isVisible():
             # un seul morceau de dessin par appel : grand panneau 1 fois sur 3, petits panneaux à tour de rôle
@@ -232,6 +242,17 @@ class SwarmDebugView:
                 self._draw_drone(self._panels[i], drones[i])
             self._job += 1
         self._app.processEvents()                 # fenêtre réactive à chaque pas (pas seulement quand on dessine)
+        self._restore_gl()
+
+    @staticmethod
+    def _restore_gl() -> None:
+        """Qt (création / fermeture de fenêtre, événements) peut laisser son propre contexte OpenGL courant :
+        le simulateur (pyglet) plante alors au pas suivant ("No GL context"). On remet le sien."""
+        try:
+            import arcade
+            arcade.get_window().switch_to()
+        except Exception as e:
+            print('RESTORE_GL FAIL', repr(e))
 
     @staticmethod
     def _role(d):

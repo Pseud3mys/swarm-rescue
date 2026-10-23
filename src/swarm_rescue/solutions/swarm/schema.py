@@ -81,6 +81,7 @@ class Mission:
     started: int = 0
     peer: int = -1      # FOLLOW : meneur suivi ; CARRY : receveur demandé (passage de relais) ; RECEIVE : porteur
     dest: Optional[Vec] = None   # DROP : point de dépose (devant la porte de la pièce, hors de l'axe de passage)
+                                 # EXPLORE : ma dernière dépose devant une porte (le plan ne me la redonne pas)
 
 
 @dataclass(frozen=True)

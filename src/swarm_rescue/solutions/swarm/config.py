@@ -129,8 +129,8 @@ class Params:
     standby_ring: float = 110.0        # px : base et réserve en anneau autour du centre, pas sur son point d'accès
     wounded_bonus: float = 80.0        # un blessé passe devant une frontière (en coût de chemin)
     sticky_radius: float = 60.0        # px : même tâche si la cible a bougé de moins que ça
-    sticky_gain: float = 0.7           # hystérésis : coût de la tâche déjà annoncée x 0.7 ...
-    sticky_bonus: float = 5.0          # ... moins ce bonus
+    sticky_gain: float = 0.6           # hystérésis : coût de la tâche déjà annoncée x 0.6 ...
+    sticky_bonus: float = 20.0         # ... moins ce bonus (5 : les relais et la base tournaient à chaque plan)
     follow_dist: float = 70.0          # px : le suiveur se tient à cette distance derrière le meneur
     pair_max: float = 160.0            # px : au-delà, le meneur attend son suiveur
     follow_replan: int = 12            # pas : rafraîchissement de la route du suiveur
@@ -138,8 +138,8 @@ class Params:
     topo_room_core: float = 48.0       # px : noyau de pièce = libre à plus de ça d'un mur connu (topo.py).
                                        # Les cartes du dépôt ont des ouvertures de 70-170 px : 36 (prototype) fusionnait
                                        # tout sur MapMedium02 ; 48 validé sur la vérité terrain (56 fusionne le hall)
-    explore_switch_penalty: float = 40.0  # un explorateur dont la région est encore ouverte ne part chercher un
-                                          # blessé hors de sa région que si c'est nettement rentable
+    explore_switch_penalty: float = 60.0  # teamplan (étape 5) : surcoût d'un blessé pour un drone qui explore :
+                                          # il ne quitte sa voie que si c'est nettement rentable
     region_sticky_gain: float = 0.5    # un meneur garde la région qu'il explore tant qu'elle est ouverte
     relay_snap_cells: int = 8          # un relais peut être décalé de 8 cellules (64 px) pour sortir des passages :
                                        # la radio traverse les murs, il n'a pas besoin d'être sur le chemin
@@ -150,8 +150,8 @@ class Params:
     claim_radius: float = 200.0        # px : frontière déjà prise par un drone d'un AUTRE réseau (sa cible / position)
     claim_penalty: float = 120.0       # surcoût de ces frontières (en coût de chemin)
     lane_region_bonus: float = 60.0    # exploration en profondeur : on finit la pièce où l'on est avant d'en changer
-    lane_sticky_radius: float = 120.0  # px : on garde sa voie d'exploration si la frontière visée est encore là
-    lane_sticky_bonus: float = 40.0
+    lane_sticky_radius: float = 150.0  # px : on garde sa voie d'exploration si la frontière visée est encore là
+    lane_sticky_bonus: float = 80.0    # (40 : meneur et suiveur d'un binôme s'échangeaient les rôles)
     explore_refresh: int = 10          # pas : un meneur recible la frontière ouverte la plus proche de lui
     max_lanes: int = 6                 # voies d'exploration (meneurs) au plus
     lane_share: float = 0.5            # part des drones libres d'un réseau qui mènent une voie d'exploration (le reste :
@@ -186,6 +186,8 @@ class Params:
     carry_heading_tol: float = 20.0    # deg : le cap du porteur ne suit la route qu'au-delà de cet écart
     explore_take_dist: float = 90.0    # px : un meneur aussi près d'un blessé libre le prend lui-même
     drop_check_steps: int = 20         # après une dépose, un blessé encore visible n'est PAS sauvé
+    drop_self_ban: int = 300           # pas : après une dépose devant une porte, le déposeur ne reprend pas ce blessé
+    wounded_claim_time: int = 300      # pas : blessé réservé par le dernier état connu d'un drone hors de mon réseau
     home_window: int = 2500            # pas avant la fin à partir desquels on évalue le retour au départ
     home_speed_frac: float = 0.6       # vitesse moyenne de retour (freinages, virages, croisements) / v_cruise
     home_margin: int = 120             # pas de marge

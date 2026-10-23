@@ -156,11 +156,11 @@ class TeamPlanner:
             pool.remove(i)
 
         # ---- 1. dépose à la porte (explorateur dans une pièce finie qui contient un blessé)
-        wounded = self._wounded(t, G)
+        wounded = self._wounded(t, G, outside)
         dropped = set()
         for i, (o, pos, mis) in enumerate(agents):
-            if mis.kind != MissionKind.EXPLORE:
-                continue
+            if mis.kind != MissionKind.EXPLORE or n < p.small_net:
+                continue                                 # petit réseau : personne d'autre ne viendrait le prendre
             rid = topo.region_at(pos, search=3)
             reg = topo.regions.get(rid)
             if reg is None or reg.kind == CORRIDOR or reg.parent < 0 or reg.link < 0:
@@ -173,7 +173,7 @@ class TeamPlanner:
                 continue
             door = topo.links[reg.link].pos
             inroom = [(k, wp) for k, wp in enumerate(wounded) if k not in dropped
-                      and topo.region_at(wp, search=2) == rid and np.linalg.norm(wp - door) > 50.0]
+                      and topo.region_at(wp, search=2) == rid and np.linalg.norm(wp - door) > self._at_door()]
             if not inroom:
                 continue
             k, wp = min(inroom, key=lambda x: float(PlanGrid.lookup(dm[i], G.cell(x[1]), radius=3)))
@@ -198,6 +198,12 @@ class TeamPlanner:
         reserve_w = min(len(reserve_cand), max(len(pool) // 3, 1)) if reserve_cand else 0
         k_lanes = min(p.max_lanes, len(fr), max(1, math.ceil(p.lane_share * len(pool))),
                       max(len(pool) - n_base - reserve_w, 0))
+        # Hystérésis : les voies déjà actives (meneurs annoncés) restent ouvertes tant qu'il y a des frontières. Sinon un
+        # blessé qui apparaît (réserve) fermait une voie et rebattait tous les rôles (meneur -> relais -> suiveur ...) ;
+        # on garde au moins un drone libre pour les blessés.
+        n_cur = sum(1 for i in pool if agents[i][2].kind == MissionKind.EXPLORE)
+        keep = min(n_cur, max(len(pool) - n_base - min(reserve_w, 1), 0))
+        k_lanes = min(p.max_lanes, len(fr), max(k_lanes, keep))
         leaders = []                                         # (index agent, index frontière)
         if k_lanes > 0:
             cost = np.full((n, len(fr)), np.inf)
@@ -304,7 +310,11 @@ class TeamPlanner:
                     if not math.isfinite(c):
                         continue
                     if s.kind == "wounded":
+                        if mis.kind == MissionKind.EXPLORE and mis.dest is not None                                 and math.hypot(mis.dest[0] - s.xy[0], mis.dest[1] - s.xy[1]) < 60.0:
+                            continue                         # il vient de le déposer devant la porte : un autre ira
                         c -= p.wounded_bonus
+                        if mis.kind == MissionKind.EXPLORE:
+                            c += p.explore_switch_penalty   # un explorateur continue d'explorer, un autre ira
                     if mis.kind == _SLOT_MISSION[s.kind] and mis.target is not None \
                             and np.linalg.norm(np.array(mis.target) - s.xy) < p.sticky_radius:
                         c = c * p.sticky_gain - p.sticky_bonus      # hystérésis : on garde sa tâche annoncée
@@ -342,6 +352,8 @@ class TeamPlanner:
         topo, G = self._topo, self.grid
         if topo is None or G is None:
             return None
+        if self.last is not None and len(self.last.component) < self.p.small_net:
+            return None                                       # petit réseau : personne d'autre ne viendrait le prendre
         rid = topo.region_at(pos, search=3)
         reg = topo.regions.get(rid)
         if reg is None or reg.kind == CORRIDOR or reg.parent < 0 or reg.link < 0:
@@ -350,7 +362,7 @@ class TeamPlanner:
             return None                                       # on reste dans la pièce : pas encore
         door = topo.links[reg.link].pos
         inroom = [wp for wp in self._wounded(t, G) if topo.region_at(wp, search=2) == rid
-                  and np.linalg.norm(wp - door) > 50.0]
+                  and np.linalg.norm(wp - door) > self._at_door()]
         if not inroom:
             return None
         wp = min(inroom, key=lambda q: float(np.linalg.norm(q - np.asarray(pos))))
@@ -360,9 +372,14 @@ class TeamPlanner:
         return Mission(MissionKind.DROP, (float(wp[0]), float(wp[1])), t, -1, (float(dest[0]), float(dest[1])))
 
     # ------------------------------------------------------------------ entrées
-    def _wounded(self, t: int, G: PlanGrid) -> list[np.ndarray]:
+    def _wounded(self, t: int, G: PlanGrid, outside=()) -> list[np.ndarray]:
         w = self.w
         carriers = [a for a in w.others() if t - a.t < 400 and a.mission.kind in (MissionKind.CARRY, MissionKind.DROP)]
+        # Blessé visé par un drone d'un AUTRE réseau (dernier état connu) : il s'en occupe, même s'il ne m'entend plus
+        # (zone sans radio). Sinon chaque changement de composition du réseau me le faisait réattribuer, et un drone
+        # traversait la carte vers un blessé déjà porté. Comme claim_penalty pour les frontières.
+        claims = [np.array(a.mission.target) for a in outside if t - a.t < self.p.wounded_claim_time
+                  and a.mission.kind == MissionKind.GOTO_WOUNDED and a.mission.target is not None]
         out = []
         for o in w.objects_view(ObjKind.WOUNDED):
             if o.state in (ObjState.RESCUED, ObjState.TAKEN) or (o.state == ObjState.CARRIED and carriers):
@@ -371,6 +388,8 @@ class TeamPlanner:
             if any(a.mission.kind == MissionKind.DROP and a.mission.target is not None
                    and np.linalg.norm(np.array(a.mission.target) - pos) < 40.0 for a in carriers):
                 continue                                     # un explorateur est en train de le déposer
+            if any(np.linalg.norm(q - pos) < 40.0 for q in claims):
+                continue
             if math.isfinite(G.cost_to(pos)):
                 out.append(pos)
         return out
@@ -506,6 +525,12 @@ class TeamPlanner:
             if len(out) >= n_ring:
                 break
         return out
+
+    def _at_door(self) -> float:
+        """Distance à la porte en deçà de laquelle un blessé y est déjà déposé : décalage de dépose + blessé pendu au
+        drone (25 px) + marge. À 50 px, un blessé tout juste déposé (~65 px) était « encore dans la pièce » : le
+        déposeur le reprenait pour le déposer à nouveau."""
+        return self.p.drop_offset + 25.0 + 30.0
 
     def _drop_point(self, G: PlanGrid, topo: TopoMap, reg, door) -> Optional[np.ndarray]:
         """Dépose : derrière la porte, côté pièce parente, à drop_offset px, sur une cellule libre hors axe de passage

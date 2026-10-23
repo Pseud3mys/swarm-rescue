@@ -93,6 +93,8 @@ class Brain:
         self._take_full = False         # DROP pris par le meneur sur un blessé proche : après la saisie, sauvetage complet
         self._last_explore = -10 ** 9
         self._disc = None               # disque de rayon check_near (cf. _mark_near)
+        self._lane = None               # dernière cible d'exploration (voie reprise après une dépose devant une porte)
+        self._dropped = None            # (position, instant) de ma dernière dépose devant une porte, annoncée (mission.dest)
         self.mission_src = "start"
         self._no_follow: dict = {}      # meneur -> pas jusqu'auquel je ne le suis plus (un autre suiveur est mieux placé)
         self._wl_last: dict = {}        # blessé fixe -> dernier recalage de l'EKF dessus
@@ -185,9 +187,17 @@ class Brain:
                 w.move_track(self._carry_key, pose.pos + 25.0 * np.array((math.cos(pose.theta + self._carry_bearing),
                                                                           math.sin(pose.theta + self._carry_bearing))), t)
                 w.set_state(self._carry_key, ObjState.SEEN, t)
+                xy = w.objects[self._carry_key].pos
                 self._carry_key = None
-                self.mission = Mission(MissionKind.IDLE)
+                # Je reprends ma voie d'exploration, en annonçant ma dépose (dest de la mission, diffusée) : le plan
+                # d'équipe, le même chez tous, ne me redonne pas ce blessé (teamplan, étape 5) ; un autre viendra.
+                # Sans ça j'étais le plus proche et je le reprenais au pas suivant : la dépose ne servait à rien.
+                self._dropped = ((float(xy[0]), float(xy[1])), t)
+                self.mission = Mission(MissionKind.EXPLORE, self._lane, t, -1, self._dropped[0])
             elif self._carry_key is not None:                      # dépose : verdict après quelques pas (cf. _control)
+                # Sauvé jusqu'à preuve du contraire : resté « porté » sans porteur, la piste était libre pour les planners
+                # (teamplan._wounded, missions.candidates) et je repartais chercher le blessé que je venais de livrer
+                w.set_state(self._carry_key, ObjState.RESCUED, t)
                 self._pending_drop = (self._carry_key, t + self.p.drop_check_steps, t)
                 self._carry_key = None
             self._grasp = 1 if f.carrying else 0
@@ -504,6 +514,10 @@ class Brain:
             if chosen is not None:
                 break
         self.mission = chosen or Mission(MissionKind.IDLE)
+        if self.mission.kind == MissionKind.EXPLORE and self.mission.target is not None:
+            self._lane = self.mission.target
+        if self.mission.kind == MissionKind.EXPLORE and self._dropped is not None                 and t - self._dropped[1] < p.drop_self_ban:
+            self.mission = replace(self.mission, dest=self._dropped[0])   # dépose encore annoncée (cf. step)
         # origine de la mission (debug / mesures) : plan d'équipe, repli individuel faute de route, ou pas de ligne
         self.mission_src = ("carry" if f.carrying else "team" if chosen is not None and chosen is team_mission
                             else "fallback" if team_mission is not None else "no-team")
@@ -663,9 +677,20 @@ class Brain:
         if m.kind in (MissionKind.GOTO_WOUNDED, MissionKind.DROP) and m.target is not None:
             tgt = np.array(m.target)
             mine = float(np.linalg.norm(tgt - me))
+            # Le plan d'équipe de mon réseau (longueur de chemin) me donne cette cible : il fait foi face aux drones de ce
+            # réseau, qui calculent le même plan. Sinon la distance à vol d'oiseau ci-dessous désignait parfois l'autre
+            # (mur entre les deux) : je laissais la cible, le plan me la redonnait, et ainsi de suite.
+            plan = self.team.last
+            mine_in_plan = None
+            if plan is not None and t - plan.t <= self.p.replan_period:
+                mp = plan.missions.get(self.me)
+                if mp is not None and mp.target is not None and math.dist(mp.target, m.target) < 40.0:
+                    mine_in_plan = set(plan.component)
             for a in self.world.others():
                 if t - a.t > 10 or a.mission.target is None \
                         or a.mission.kind not in (MissionKind.GOTO_WOUNDED, MissionKind.DROP):
+                    continue
+                if mine_in_plan is not None and a.origin in mine_in_plan:
                     continue
                 if np.linalg.norm(np.array(a.mission.target) - tgt) > 40.0:
                     continue
@@ -747,6 +772,7 @@ class Brain:
         if r is None:
             return
         self.mission = replace(self.mission, target=(float(best[0]), float(best[1])))
+        self._lane = self.mission.target
         self.route = r
         self.follower.set_route(r)
 
@@ -824,8 +850,7 @@ class Brain:
             if any(st == ObjState.SEEN and d < 70.0 for _, d, st in seen["wounded"]) and t > t_drop + 2:
                 self.world.set_state(key, ObjState.SEEN, t)           # toujours là : non sauvé
                 self._pending_drop = None
-            elif t >= deadline:
-                self.world.set_state(key, ObjState.RESCUED, t)        # disparu : sauvé
+            elif t >= deadline:                                       # disparu : sauvé (déjà marqué au lâcher)
                 self._pending_drop = None
 
         if self.mission.kind in (MissionKind.GOTO_WOUNDED, MissionKind.DROP) and not f.carrying and self.mission.target is not None:

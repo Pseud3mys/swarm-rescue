@@ -74,6 +74,12 @@ class MissionPlanner:
             pos = np.array(o.pos)
             if self._banned(pos, t) or any(np.linalg.norm(pos - q) < 50.0 for q in taken):
                 continue
+            if current is not None and current.kind == MissionKind.EXPLORE and current.dest is not None                     and np.linalg.norm(pos - np.array(current.dest)) < 60.0:
+                continue                                             # je viens de le déposer (cf. teamplan)
+            if any(t - a.t > 10 and t - a.t < p.wounded_claim_time and a.mission.kind == MissionKind.GOTO_WOUNDED
+                   and a.mission.target is not None and np.linalg.norm(np.array(a.mission.target) - pos) < 50.0
+                   for a in others):
+                continue                                             # visé par un drone hors de portée (cf. teamplan)
             mine = grid.cost_to(pos)
             if not math.isfinite(mine):
                 continue
@@ -119,7 +125,7 @@ class MissionPlanner:
         if out:
             return out
 
-        h = self.home()
-        if h is not None and np.linalg.norm(h - pose.pos) > 60.0:
-            return [Mission(MissionKind.RETURN, (float(h[0]), float(h[1])), t)]
+        # Rien de libre pour moi : j'attends sur place la prochaine allocation. Pas de RETURN ici : ce repli sert quand la
+        # ligne du plan d'équipe est refusée (cible interdite un moment), et le drone rentrait à la base en pleine partie
+        # pour en repartir 50 pas plus tard. Le retour est géré par la fin de partie (brain._homing) et les postes de base.
         return [Mission(MissionKind.IDLE, None, t)]
