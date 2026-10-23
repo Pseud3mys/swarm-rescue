@@ -77,7 +77,11 @@ class SwarmDrone(DroneAbstract):
             inbox=[msg for (_, msg) in self.communicator.received_messages if msg is not None],
         )
         self._t += 1
-        return self._brain.step(frame).as_dict()
+        cmd = self._brain.step(frame).as_dict()
+        if self.DEBUG_VIEW:                                      # trace du run dans debug_export/ (cf. dump_maps.py)
+            from .dump_maps import record
+            record(self, self._brain, frame.t)
+        return cmd
 
     # ------------------------------------------------------------------ debug (affichage seulement)
     def display(self) -> None:

@@ -251,6 +251,13 @@ class Launcher:
         if has_crashed:
             print(error_msg)
 
+        if SwarmDrone.DEBUG_VIEW:                          # debug : carte interne de chaque drone en fin de run
+            try:
+                from swarm_rescue.solutions.dump_maps import dump_maps
+                dump_maps(the_map)
+            except Exception:
+                traceback.print_exc()
+
         score_exploration = the_map.explored_map.score() * 100.0
         score_health_returned = the_map.compute_score_health_returned() * 100
 

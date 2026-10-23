@@ -176,6 +176,7 @@ class WorldModel:
     def __init__(self, me: int, size_area, resolution: float = 8.0, chunk: int = 16):
         self.me = me
         self.map = ChunkedMap(size_area, resolution, chunk)
+        self.near = None     # (W, H) bool : passé à portée sémantique d'un drone (local, écrit par brain._mark_near)
         self.agents: dict[int, AgentState] = {}
         self.objects: dict[tuple[int, int], ObjectTrack] = {}
         self.obj_known = np.zeros(MAX_ORIGINS, dtype=np.int64)   # vecteur de versions des objets (cf. schema.py)

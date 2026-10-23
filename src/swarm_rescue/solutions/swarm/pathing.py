@@ -22,7 +22,7 @@ from scipy.sparse.csgraph import dijkstra
 
 from .config import Params
 from .gridmap import FREE_THR, OCC_THR
-from .schema import Route
+from .schema import ObjKind, ObjState, Route
 from .world import WorldModel
 
 _NB = ((1, 0, 1.0), (0, 1, 1.0), (1, 1, math.sqrt(2)), (1, -1, math.sqrt(2)))
@@ -254,6 +254,43 @@ class PlanGrid:
         near_unk = cv2.dilate(unk_core.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
         reach = np.isfinite(self._dist)
         front = free & near_unk & self.trav & reach
+        # Amas suspects : petit tas de cases « mur » isolé, de la taille d'un blessé. Vu au lidar seul (> 200 px), un
+        # blessé y ressemble exactement, et rien d'inconnu ne le trahit. Tant qu'aucun drone n'est passé à portée
+        # sémantique (world.near, cf. brain._mark_near), le traversable autour est une frontière : on s'approche, l'amas
+        # est réglé à check_near px (blessé reconnu, ou obstacle) et la frontière disparaît, sans aller s'y coller.
+        near = getattr(self.world, "near", None)
+        blobs = []
+        if near is not None:
+            occ = ((self.m.view() >= OCC_THR) & self.arena).astype(np.uint8)
+            n, lab, st, cen = cv2.connectedComponentsWithStats(occ, connectivity=8)
+            for i in range(1, n):
+                w, h, area = st[i, cv2.CC_STAT_WIDTH], st[i, cv2.CC_STAT_HEIGHT], st[i, cv2.CC_STAT_AREA]
+                if 2 <= area <= self.p.blob_max_cells and max(w, h) <= self.p.blob_max_side:
+                    bx, by = int(round(cen[i][1])), int(round(cen[i][0]))     # cv2 : (colonne, ligne) = (iy, ix)
+                    if not near[bx, by]:
+                        blobs.append((bx, by))
+        # l'inconnu collé à un blessé connu est son ombre lidar (rayons masqués) : on sait ce qu'il y a, ce n'est pas un
+        # bord à explorer (sinon le meneur vient se coller au blessé et gêne celui qui doit le prendre)
+        r = self.p.frontier_wounded_clear
+        for o in self.world.objects_view(ObjKind.WOUNDED):
+            if o.state != ObjState.SEEN:
+                continue
+            ix, iy = self.m.world_to_cell(o.pos)
+            cx, cy = int(ix[0]), int(iy[0])
+            blobs = [b for b in blobs if ((b[0] - cx) ** 2 + (b[1] - cy) ** 2) * self.m.res ** 2 > r * r]
+            k = int(math.ceil(r / self.m.res))
+            x0, x1, y0, y1 = max(cx - k, 0), min(cx + k + 1, self.W), max(cy - k, 0), min(cy + k + 1, self.H)
+            if x0 >= x1 or y0 >= y1:
+                continue
+            gx, gy = np.meshgrid(np.arange(x0, x1) - cx, np.arange(y0, y1) - cy, indexing="ij")
+            front[x0:x1, y0:y1] &= (gx * gx + gy * gy) * self.m.res ** 2 > r * r
+        if blobs:
+            k = self.p.inflate_cells + 2
+            seed = np.zeros_like(front)
+            for bx, by in blobs:
+                seed[bx, by] = True
+            ring = cv2.dilate(seed.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 3,) * 2)) > 0
+            front |= ring & free & self.trav & reach
         if not front.any():
             return []
         n, labels, stats, _ = cv2.connectedComponentsWithStats(front.astype(np.uint8), connectivity=8)

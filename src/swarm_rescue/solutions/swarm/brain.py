@@ -73,6 +73,7 @@ class Brain:
         self._hist: deque = deque(maxlen=7)            # (t, position) tous les 10 pas : détection d'absence de progrès
         self._recover_until = -1
         self._recover_dir = None
+        self._recover_theta = None      # porteur : cap visé pendant le dégagement (rotation bornée)
         self._n_recover = 0
         self._carry_since = 0
         self._handoff = None            # porteur : {"peer", "since", "ack"} passage de relais en cours
@@ -89,7 +90,9 @@ class Brain:
         self._last_follow = -10 ** 9
         self._cleared: set = set()      # blessés dont les impacts lidar ont été effacés de ma couche
         self._drop_release = False      # le lâcher en cours est une dépose volontaire devant une porte
+        self._take_full = False         # DROP pris par le meneur sur un blessé proche : après la saisie, sauvetage complet
         self._last_explore = -10 ** 9
+        self._disc = None               # disque de rayon check_near (cf. _mark_near)
         self.mission_src = "start"
         self._no_follow: dict = {}      # meneur -> pas jusqu'auquel je ne le suis plus (un autre suiveur est mieux placé)
         self._wl_last: dict = {}        # blessé fixe -> dernier recalage de l'EKF dessus
@@ -142,6 +145,12 @@ class Brain:
                                         else self.ekf.update_heading(fix[1], fix[2])):
                     pose = self.ekf.pose()
             self.scan.integrate(pose, f.lidar, f.angles, mask)
+        if t % 2 == 0:                                # amas suspects réglés par moi et mon réseau (cf. pathing)
+            if pose.sigma < p.max_pose_sigma_for_mapping:
+                self._mark_near(pose.pos)
+            for a in w.others():
+                if t - a.t <= 2 and a.pos_sigma < p.max_pose_sigma_for_mapping:
+                    self._mark_near(a.pos)
         seen = observe_semantic(w, pose, f.semantic, t, p)
         self._wounded_landmarks(t, f, seen)
         if t % 2 == 1:
@@ -165,6 +174,9 @@ class Brain:
                 self._carry_since = t
                 w.set_state(tr.key, ObjState.CARRIED, t)
                 self._clear_around_grasp(t, gp, seen)
+                if self._take_full and self.mission.kind == MissionKind.DROP:
+                    self.mission = Mission(MissionKind.IDLE)   # pris par le meneur : on le porte jusqu'au centre
+                self._take_full = False
             elif self._handoff_release:                            # passé à un autre drone : sa piste prend le relais
                 self._handoff_release = False
                 self._carry_key = None
@@ -344,6 +356,10 @@ class Brain:
             return "homing"
         if self.route is None and t - self._last_plan >= 10:
             return "no-route"
+        if self.mission.kind == MissionKind.FOLLOW and self.mission.peer >= 0 and t % 3 == 0:
+            lead = self.world.agents.get(self.mission.peer)
+            if lead is not None and t - lead.t < 10 and lead.mission.kind != MissionKind.EXPLORE:
+                return "leader-changed"                  # le meneur prend un blessé : je reprends la voie
         if t - self._last_plan >= p.replan_period:
             return "period"
         if t % 5 == 0:                                   # un blessé apparaît / disparaît : l'équipe se réorganise
@@ -682,6 +698,8 @@ class Brain:
         pièce où l'on est et pour rester sur sa voie ; les bords visés par un autre meneur sont évités."""
         self._last_explore = t
         p, w = self.p, self.world
+        if self._take_nearby_wounded(t, pose):
+            return
         grid = PlanGrid(w, p, pose.pos, extra_cost=extra_cost_from_agents(w, t, w.map, (w.map.W, w.map.H), self.me))
         grid.solve()
         fr = grid.frontiers(p.frontier_min_cells)
@@ -722,6 +740,7 @@ class Brain:
         drop = self.team.drop_task(t, pose.pos, leaving_to=best)
         if drop is not None and not self.planner._banned(np.array(drop.target), t):
             self.mission = drop
+            self._take_full = False
             self._plan_reason = "stuck"                       # route vers le blessé au pas suivant (cf. _replan)
             return
         r = grid.route_to(best, t, self._speed(f.carrying))
@@ -730,6 +749,52 @@ class Brain:
         self.mission = replace(self.mission, target=(float(best[0]), float(best[1])))
         self.route = r
         self.follower.set_route(r)
+
+    def _mark_near(self, xy) -> None:
+        """world.near : cellules passées à moins de check_near d'un drone (moi, ou un drone de mon réseau d'après sa
+        position annoncée). Un amas suspect ainsi couvert est réglé (cf. PlanGrid.frontiers)."""
+        m = self.world.map
+        if self.world.near is None:
+            self.world.near = np.zeros((m.W, m.H), bool)
+            k = int(self.p.check_near // m.res)
+            g = np.arange(-k, k + 1)
+            gx, gy = np.meshgrid(g, g, indexing="ij")
+            self._disc = (gx * gx + gy * gy) * m.res ** 2 <= self.p.check_near ** 2
+        k = self._disc.shape[0] // 2
+        ix, iy = m.world_to_cell(np.asarray(xy, float))
+        cx, cy = int(ix[0]), int(iy[0])
+        x0, x1, y0, y1 = max(cx - k, 0), min(cx + k + 1, m.W), max(cy - k, 0), min(cy + k + 1, m.H)
+        self.world.near[x0:x1, y0:y1] |= self._disc[x0 - cx + k:x1 - cx + k, y0 - cy + k:y1 - cy + k]
+
+    def _take_nearby_wounded(self, t, pose) -> bool:
+        """Meneur à moins de explore_take_dist d'un blessé libre : il le prend lui-même et le ramène au centre. Sinon
+        il explorait l'ombre lidar du blessé en s'y collant, et gênait le drone envoyé le chercher. Mission DROP (tâche
+        en cours, hors allocation d'équipe, cf. teamplan._BUSY) convertie en sauvetage complet à la saisie ; son
+        suiveur, voyant que son meneur n'explore plus, replanifie et reprend la voie."""
+        p, me = self.p, pose.pos
+        best, bd = None, p.explore_take_dist
+        for o in self.world.objects_view(ObjKind.WOUNDED):
+            if o.state != ObjState.SEEN:
+                continue
+            op = np.array(o.pos)
+            d = float(np.linalg.norm(op - me))
+            if d >= bd or self.planner._banned(op, t):
+                continue
+            if any(t - a.t < 30 and a.mission.target is not None
+                   and a.mission.kind in (MissionKind.GOTO_WOUNDED, MissionKind.DROP, MissionKind.CARRY)
+                   and np.linalg.norm(np.array(a.mission.target) - op) < 40.0
+                   and (a.mission.kind != MissionKind.GOTO_WOUNDED or np.linalg.norm(np.array(a.pos) - op) < d)
+                   for a in self.world.others()):
+                continue                                      # quelqu'un s'en charge déjà (ou est plus près)
+            best, bd = op, d
+        if best is None:
+            return False
+        xy = (float(best[0]), float(best[1]))
+        self.mission = Mission(MissionKind.DROP, xy, t, -1, xy)
+        self.mission_src = "take"
+        self._take_full = True
+        self._plan_reason = "stuck"                           # route vers le blessé au pas suivant (cf. _replan)
+        return True
 
     def _refresh_follow(self, t, pose, f) -> None:
         """Suiveur : la route vers le meneur est recalculée souvent, sans refaire l'allocation d'équipe."""
@@ -880,7 +945,6 @@ class Brain:
             self._hist.clear()
         if t < self._recover_until:
             override_dir, override_speed, repulse = self._recover_dir, 1.0, True
-            spin = f.carrying                       # en tournant, le pivot fait orbiter le blessé : il se décroche
         elif self._recover_until >= 0:              # fin de manœuvre : on replanifie depuis la nouvelle position
             self._recover_until = -1
             self._plan_reason = "stuck"
@@ -889,17 +953,25 @@ class Brain:
             if self.mission.target is not None and self.mission.kind == MissionKind.EXPLORE:
                 self.planner.ban(self.mission.target, t + 400)
             override_dir, override_speed = self._recover_dir, 1.0
-            spin = f.carrying
 
-        if f.carrying and not spin:
+        recovering = t < self._recover_until
+        if f.carrying and recovering and self._recover_theta is not None:
+            # en tournant, le pivot fait orbiter le blessé : il se décroche. Rotation BORNÉE (une rotation libre
+            # pendant toute la manœuvre faisait un tour complet)
+            self.theta_ref = self._recover_theta
+        elif f.carrying and not spin:
             # cap du porteur : blessé DERRIÈRE nous dans le sens de la marche (il suit la trajectoire au lieu
             # d'accrocher les murs dans les virages), DEVANT nous à l'approche du centre de secours
             if override_dir is not None and not repulse:
                 self.theta_ref = _wrap_angle(math.atan2(override_dir[1], override_dir[0]) - self._carry_bearing)
             else:
                 u = override_dir if override_dir is not None else self._my_dir(pose)
+                if override_dir is None and self.route is not None and self.follower.remaining(pose.pos) < 30.0:
+                    u = None                        # fin de route : la direction de la carotte n'est que du bruit
                 if u is not None:
-                    self.theta_ref = _wrap_angle(math.atan2(-u[1], -u[0]) - self._carry_bearing)
+                    want = _wrap_angle(math.atan2(-u[1], -u[0]) - self._carry_bearing)
+                    if abs(_wrap_angle(want - self.theta_ref)) > math.radians(p.carry_heading_tol):
+                        self.theta_ref = want
 
         end_stop = self.mission.kind in (MissionKind.EXPLORE, MissionKind.CARRY, MissionKind.GOTO_WOUNDED, MissionKind.DROP,
                                          MissionKind.RETURN, MissionKind.IDLE, MissionKind.RELAY, MissionKind.FOLLOW)
@@ -942,6 +1014,8 @@ class Brain:
         dev = math.radians(40.0) * (1 if self._n_recover % 2 else -1)
         c, s_ = math.cos(dev), math.sin(dev)
         self._recover_dir = np.array((c * away[0] - s_ * away[1], s_ * away[0] + c * away[1]))
+        turn = math.radians(self.p.recover_carry_turn) * (1 if self._n_recover % 2 else -1)
+        self._recover_theta = _wrap_angle(pose.theta + turn) if f.carrying else None
 
 
 def _truncate(r: Route, back: float, here) -> Route:

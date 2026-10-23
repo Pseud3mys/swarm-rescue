@@ -90,6 +90,11 @@ class Params:
     sem_sigma_r: float = 2.0
     sem_sigma_b: float = 0.05          # rad (~3° : écart-type d'une erreur uniforme de ±5°)
     wounded_radius: float = 12.0
+    # amas suspects (pathing.frontiers) : petit tas « mur » isolé de la taille d'un blessé (diamètre 24 px = 3 cellules)
+    blob_max_cells: int = 16           # cellules occupées au plus
+    blob_max_side: int = 5             # cellules : côté max de sa boîte englobante
+    check_near: float = 140.0          # px : amas réglé quand un drone est passé à moins de ça (capteur sémantique
+                                       # 200 px, 35 rayons : un blessé y est vu à coup sûr)
 
     # ---- planification --------------------------------------------------------------------------
     inflate_cells: int = 2             # gonflage des obstacles (cellules) : contrainte dure (16 px + rayon du drone)
@@ -99,6 +104,7 @@ class Params:
     inflate_cells_tight: int = 1       # repli si le but est injoignable
     unknown_cost: float = 2.5          # coût d'un pas en terrain inconnu (planification optimiste)
     frontier_min_cells: int = 3
+    frontier_wounded_clear: float = 52.0   # px : pas de frontière collée à un blessé connu (son ombre lidar)
     replan_period: int = 30          # l'allocation doit suivre les cartes et objets gossipés, pas seulement les blocages
     switch_gain: float = 0.75          # une nouvelle cible doit coûter < 75 % de l'actuelle pour la remplacer
 
@@ -176,6 +182,9 @@ class Params:
     handoff_range: float = 220.0       # px : et à portée radio du porteur
     handoff_timeout: int = 200         # pas : passage de relais abandonné au-delà
     recover_steps: int = 30            # durée de la manœuvre de dégagement après un blocage
+    recover_carry_turn: float = 60.0   # deg : en portant, rotation bornée pendant le dégagement (sens alterné)
+    carry_heading_tol: float = 20.0    # deg : le cap du porteur ne suit la route qu'au-delà de cet écart
+    explore_take_dist: float = 90.0    # px : un meneur aussi près d'un blessé libre le prend lui-même
     drop_check_steps: int = 20         # après une dépose, un blessé encore visible n'est PAS sauvé
     home_window: int = 2500            # pas avant la fin à partir desquels on évalue le retour au départ
     home_speed_frac: float = 0.6       # vitesse moyenne de retour (freinages, virages, croisements) / v_cruise

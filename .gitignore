@@ -69,3 +69,7 @@ MANIFEST
 .venv*/
 .conda*/
 .python-version
+
+# Debug exports (cartes des drones, trace des runs)
+map_exports/
+debug_export/
