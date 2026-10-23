@@ -32,8 +32,12 @@ from swarm_rescue.maps.map_medium_02 import MapMedium02
 from swarm_rescue.maps.map_test_special_zones import MapTestSpecialZones
 
 from swarm_rescue.solutions.my_drone_eval import MyDroneEval
-from swarm_rescue.solutions.my_drone_navigation import MyDroneNavigation
 from swarm_rescue.solutions.drone import SwarmDrone
+
+# Local (Windows HiDPI) : arcade force pyglet en mode "stretch", qui divise la taille des fenêtres par l'échelle
+# d'affichage ; la fenêtre invisible 1x1 du playground tombe alors à 0 px (ZeroDivisionError à la création de la carte)
+import pyglet
+pyglet.options.dpi_scaling = "real"
 
 
 class MyDrone(SwarmDrone):
