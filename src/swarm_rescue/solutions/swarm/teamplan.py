@@ -243,6 +243,11 @@ class TeamPlanner:
 
         # ---- 3. relais : chaîne base -> meneur, derrière lui, hors des passages
         budget = max(len(pool) - n_base - reserve_w, 0)
+        # Explorateur prioritaire sur relais : les relais ne se prennent que parmi les drones qui n'explorent pas. Avant,
+        # la chaîne s'allongeait à mesure que les meneurs avançaient et consommait les explorateurs non reconduits
+        # meneurs à ce plan (frontières trop proches) : ils devenaient relais, puis suiveurs, puis meneurs ... Une chaîne
+        # qu'on ne peut pas pourvoir n'est pas posée : la liaison avec ce meneur devient intermittente.
+        relay_budget = max(sum(1 for i in pool if agents[i][2].kind != MissionKind.EXPLORE) - n_base - reserve_w, 0)
         lane_paths = []
         for i, j in leaders:
             path = G.path_cells(fr[j]["cell"], pred_root, root_cell)
@@ -259,7 +264,7 @@ class TeamPlanner:
                 continue
             lead_d = float(PlanGrid.lookup(dist_root, acells[i], radius=2))
             new = self._relays_for(G, path, root_xy, relays, lead_d, dist_root, on_path)
-            if new is not None and len(new) <= budget - len(relays):
+            if new is not None and len(new) <= relay_budget - len(relays):
                 relays += new
         # ---- 4. suiveurs : le drone libre le plus proche de chaque meneur (s'il en reste au-delà des relais)
         n_follow = max(budget - len(relays), 0)
@@ -296,6 +301,18 @@ class TeamPlanner:
                     if np.linalg.norm(f2["xy"] - fr[j]["xy"]) < p.frontier_spacing:
                         cost[:, j2] = np.inf
                 extra -= 1
+        # explorateur resté sans voie (frontières déjà prises à moins de frontier_spacing) : il garde la frontière de sa
+        # voie si elle existe encore, plutôt que d'être renvoyé attendre à la base (poste « base », annoncé RELAY)
+        for i in list(pool):
+            mis = agents[i][2]
+            if mis.kind != MissionKind.EXPLORE or mis.target is None:
+                continue
+            near = [j for j, f in enumerate(fr) if math.isfinite(PlanGrid.lookup(dm[i], f["cell"], radius=1))
+                    and math.hypot(mis.target[0] - f["xy"][0], mis.target[1] - f["xy"][1]) < p.lane_sticky_radius]
+            if near:
+                j = min(near, key=lambda j: PlanGrid.lookup(dm[i], fr[j]["cell"], radius=1))
+                leaders.append((i, j))
+                take(i, Slot("leader", fr[j]["xy"], fr[j]["cell"]))
         # ---- 5. blessés, relais, base : hongrois sur les drones restants
         rest_slots = [Slot("wounded", wp, c) for wp in free_wounded if (c := G.nearest_reachable(wp)) is not None]
         rest_slots += [Slot("relay", r, G.cell(r)) for r in relays]
@@ -310,11 +327,12 @@ class TeamPlanner:
                     if not math.isfinite(c):
                         continue
                     if s.kind == "wounded":
-                        if mis.kind == MissionKind.EXPLORE and mis.dest is not None                                 and math.hypot(mis.dest[0] - s.xy[0], mis.dest[1] - s.xy[1]) < 60.0:
+                        if mis.kind == MissionKind.EXPLORE and mis.dest is not None \
+                                and math.hypot(mis.dest[0] - s.xy[0], mis.dest[1] - s.xy[1]) < 60.0:
                             continue                         # il vient de le déposer devant la porte : un autre ira
                         c -= p.wounded_bonus
-                        if mis.kind == MissionKind.EXPLORE:
-                            c += p.explore_switch_penalty   # un explorateur continue d'explorer, un autre ira
+                    if mis.kind == MissionKind.EXPLORE and s.kind != "follower":
+                        c += p.explore_switch_penalty       # un explorateur continue d'explorer : un autre prend la tâche
                     if mis.kind == _SLOT_MISSION[s.kind] and mis.target is not None \
                             and np.linalg.norm(np.array(mis.target) - s.xy) < p.sticky_radius:
                         c = c * p.sticky_gain - p.sticky_bonus      # hystérésis : on garde sa tâche annoncée

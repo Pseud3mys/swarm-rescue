@@ -516,7 +516,8 @@ class Brain:
         self.mission = chosen or Mission(MissionKind.IDLE)
         if self.mission.kind == MissionKind.EXPLORE and self.mission.target is not None:
             self._lane = self.mission.target
-        if self.mission.kind == MissionKind.EXPLORE and self._dropped is not None                 and t - self._dropped[1] < p.drop_self_ban:
+        if self.mission.kind == MissionKind.EXPLORE and self._dropped is not None \
+                and t - self._dropped[1] < p.drop_self_ban:
             self.mission = replace(self.mission, dest=self._dropped[0])   # dépose encore annoncée (cf. step)
         # origine de la mission (debug / mesures) : plan d'équipe, repli individuel faute de route, ou pas de ligne
         self.mission_src = ("carry" if f.carrying else "team" if chosen is not None and chosen is team_mission
@@ -973,7 +974,8 @@ class Brain:
         elif self._recover_until >= 0:              # fin de manœuvre : on replanifie depuis la nouvelle position
             self._recover_until = -1
             self._plan_reason = "stuck"
-        elif expect_move and len(self._hist) == self._hist.maxlen                 and np.linalg.norm(self._hist[-1][1] - self._hist[0][1]) < 10.0:
+        elif expect_move and len(self._hist) == self._hist.maxlen \
+                and np.linalg.norm(self._hist[-1][1] - self._hist[0][1]) < 10.0:
             self._start_recovery(t, pose, f)
             if self.mission.target is not None and self.mission.kind == MissionKind.EXPLORE:
                 self.planner.ban(self.mission.target, t + 400)

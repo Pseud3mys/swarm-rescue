@@ -74,7 +74,8 @@ class MissionPlanner:
             pos = np.array(o.pos)
             if self._banned(pos, t) or any(np.linalg.norm(pos - q) < 50.0 for q in taken):
                 continue
-            if current is not None and current.kind == MissionKind.EXPLORE and current.dest is not None                     and np.linalg.norm(pos - np.array(current.dest)) < 60.0:
+            if current is not None and current.kind == MissionKind.EXPLORE and current.dest is not None \
+                    and np.linalg.norm(pos - np.array(current.dest)) < 60.0:
                 continue                                             # je viens de le déposer (cf. teamplan)
             if any(t - a.t > 10 and t - a.t < p.wounded_claim_time and a.mission.kind == MissionKind.GOTO_WOUNDED
                    and a.mission.target is not None and np.linalg.norm(np.array(a.mission.target) - pos) < 50.0
